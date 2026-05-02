@@ -45,6 +45,20 @@ app.post("/alexa", async (req, res) => {
       return res.json(response);
     }
 
+    // Handle Fallback Intent
+    if (req.body.request?.intent?.name === "AMAZON.FallbackIntent") {
+      return res.json({
+        version: "1.0",
+        response: {
+          outputSpeech: {
+            type: "PlainText",
+            text: "Sorry, I didn't understand. Try saying, ask Jarvis your question.",
+          },
+          shouldEndSession: false,
+        },
+      });
+    }
+
     // ✅ Intent Request (user query)
     let userQuery = req.body.request?.intent?.slots?.query?.value || "Hello";
 
