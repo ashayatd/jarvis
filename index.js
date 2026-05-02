@@ -10,7 +10,9 @@ const logError = (...args) => console.error("[ERROR]", ...args);
 
 // ✅ Initialize Gemini AFTER dotenv
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
+const model = genAI.getGenerativeModel({
+  model: "models/text-bison-001"
+});
 const app = express();
 app.use(express.json());
 
