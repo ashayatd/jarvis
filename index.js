@@ -11,20 +11,81 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// app.post("/alexa", async (req, res) => {
+//   try {
+//     const intent = req.body.request?.intent;
+
+//     let userQuery = intent?.slots?.query?.value || "Hello";
+
+//     console.log("User Query:", userQuery);
+
+//     const response = await openai.responses.create({
+//       model: "gpt-4.1-mini",
+//       input: userQuery,
+//     });
+
+//     const reply = response.output_text || "Sorry, I didn't get that.";
+
+//     return res.json({
+//       version: "1.0",
+//       response: {
+//         outputSpeech: {
+//           type: "PlainText",
+//           text: reply,
+//         },
+//         shouldEndSession: false,
+//       },
+//     });
+//   } catch (error) {
+//     console.error(error);
+
+//     return res.json({
+//       version: "1.0",
+//       response: {
+//         outputSpeech: {
+//           type: "PlainText",
+//           text: "Something went wrong.",
+//         },
+//         shouldEndSession: false,
+//       },
+//     });
+//   }
+// });
+
+
 app.post("/alexa", async (req, res) => {
   try {
-    const intent = req.body.request?.intent;
+    console.log("REQUEST:", JSON.stringify(req.body, null, 2));
 
-    let userQuery = intent?.slots?.query?.value || "Hello";
+    const requestType = req.body.request?.type;
+
+    // ✅ HANDLE: "open jarvis"
+    if (requestType === "LaunchRequest") {
+      return res.json({
+        version: "1.0",
+        response: {
+          outputSpeech: {
+            type: "PlainText",
+            text: "Jarvis activated. What do you want to know?",
+          },
+          shouldEndSession: false,
+        },
+      });
+    }
+
+    // ✅ HANDLE: user query
+    let userQuery =
+      req.body.request?.intent?.slots?.query?.value || "Hello";
 
     console.log("User Query:", userQuery);
 
-    const response = await openai.responses.create({
+    const aiResponse = await openai.responses.create({
       model: "gpt-4.1-mini",
       input: userQuery,
     });
 
-    const reply = response.output_text || "Sorry, I didn't get that.";
+    const reply =
+      aiResponse.output_text || "Sorry, I didn't get that.";
 
     return res.json({
       version: "1.0",
@@ -44,7 +105,7 @@ app.post("/alexa", async (req, res) => {
       response: {
         outputSpeech: {
           type: "PlainText",
-          text: "Something went wrong.",
+          text: "Something went wrong",
         },
         shouldEndSession: false,
       },
