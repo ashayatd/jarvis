@@ -11,7 +11,7 @@ const logError = (...args) => console.error("[ERROR]", ...args);
 // ✅ Initialize Gemini AFTER dotenv
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
-  model: "models/text-bison-001"
+  model: "gemini-flash-latest",
 });
 const app = express();
 app.use(express.json());
@@ -46,8 +46,7 @@ app.post("/alexa", async (req, res) => {
     }
 
     // ✅ Intent Request (user query)
-    let userQuery =
-      req.body.request?.intent?.slots?.query?.value || "Hello";
+    let userQuery = req.body.request?.intent?.slots?.query?.value || "Hello";
 
     log("User Query:", userQuery);
 
@@ -56,8 +55,7 @@ app.post("/alexa", async (req, res) => {
 
     // ✅ Gemini call
     const result = await model.generateContent(prompt);
-    const reply =
-      result.response.text() || "Sorry, I didn't get that.";
+    const reply = result.response.text() || "Sorry, I didn't get that.";
 
     log("AI Reply:", reply);
 
