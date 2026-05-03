@@ -4,19 +4,23 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
-// Logging utility
+// Logging
 const log = (...args) => console.log("[LOG]", ...args);
 const logError = (...args) => console.error("[ERROR]", ...args);
 
-// ✅ Initialize Gemini AFTER dotenv
+// Gemini setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
   model: "gemini-flash-latest",
 });
+
 const app = express();
 app.use(express.json());
 
-// Log all incoming requests
+// 🧠 Simple in-memory conversation
+let chatHistory = [];
+
+// Log requests
 app.use((req, res, next) => {
   log(`Incoming ${req.method} ${req.url}`);
   next();
@@ -28,11 +32,11 @@ app.post("/alexa", async (req, res) => {
     log("REQUEST BODY:", JSON.stringify(req.body, null, 2));
 
     const requestType = req.body.request?.type;
-    log("Request Type:", requestType);
+    const intentName = req.body.request?.intent?.name;
 
-    // ✅ Launch Request (open jarvis)
+    // ✅ Launch Request
     if (requestType === "LaunchRequest") {
-      const response = {
+      return res.json({
         version: "1.0",
         response: {
           outputSpeech: {
@@ -41,39 +45,69 @@ app.post("/alexa", async (req, res) => {
           },
           shouldEndSession: false,
         },
-      };
-      return res.json(response);
+      });
     }
 
-    // Handle Fallback Intent
-    if (req.body.request?.intent?.name === "AMAZON.FallbackIntent") {
+    // 🧠 Extract user query (handle fallback too)
+    let userQuery =
+      req.body.request?.intent?.slots?.query?.value ||
+      req.body.request?.inputTranscript ||
+      "Hello";
+
+    log("User Query:", userQuery);
+
+    const lower = userQuery.toLowerCase();
+
+    // 🚪 Exit command
+    if (
+      lower.includes("exit") ||
+      lower.includes("stop") ||
+      lower.includes("quit") ||
+      lower.includes("close")
+    ) {
+      chatHistory = [];
+
       return res.json({
         version: "1.0",
         response: {
           outputSpeech: {
             type: "PlainText",
-            text: "Sorry, I didn't understand. Try saying, ask AI your question.",
+            text: "Exiting AI mode. Goodbye!",
           },
-          shouldEndSession: false,
+          shouldEndSession: true,
         },
       });
     }
 
-    // ✅ Intent Request (user query)
-    let userQuery = req.body.request?.intent?.slots?.query?.value || "Hello";
+    // 🧠 Add to memory
+    chatHistory.push(`User: ${userQuery}`);
 
-    log("User Query:", userQuery);
+    // 🧠 Prompt with context
+    const prompt = `
+You are AI mode, a smart, slightly witty assistant.
 
-    // 🧠 Add Jarvis personality
-    const prompt = `You are AI, a smart, slightly witty AI assistant. Keep responses short and conversational. User: ${userQuery}`;
+Conversation so far:
+${chatHistory.join("\n")}
 
-    // ✅ Gemini call
+Rules:
+- Be short and conversational
+- If user says things like "I choose 1", understand based on previous response
+- Maintain context
+
+Respond to the latest user message.
+`;
+
+    // 🤖 Gemini call
     const result = await model.generateContent(prompt);
-    const reply = result.response.text() || "Sorry, I didn't get that.";
+    const reply =
+      result.response.text() || "Sorry, I didn't get that.";
 
     log("AI Reply:", reply);
 
-    const response = {
+    // 🧠 Save AI response
+    chatHistory.push(`AI: ${reply}`);
+
+    return res.json({
       version: "1.0",
       response: {
         outputSpeech: {
@@ -82,9 +116,7 @@ app.post("/alexa", async (req, res) => {
         },
         shouldEndSession: false,
       },
-    };
-
-    return res.json(response);
+    });
   } catch (error) {
     logError("Error in /alexa handler:", error);
 
