@@ -37,7 +37,7 @@ app.post("/alexa", async (req, res) => {
         response: {
           outputSpeech: {
             type: "PlainText",
-            text: "Jarvis activated. What do you want to know?",
+            text: "AI mode activated. How can I assist you?",
           },
           shouldEndSession: false,
         },
@@ -52,7 +52,7 @@ app.post("/alexa", async (req, res) => {
         response: {
           outputSpeech: {
             type: "PlainText",
-            text: "Sorry, I didn't understand. Try saying, ask Jarvis your question.",
+            text: "Sorry, I didn't understand. Try saying, ask AI your question.",
           },
           shouldEndSession: false,
         },
@@ -65,7 +65,7 @@ app.post("/alexa", async (req, res) => {
     log("User Query:", userQuery);
 
     // 🧠 Add Jarvis personality
-    const prompt = `You are Jarvis, a smart, slightly witty AI assistant. Keep responses short and conversational. User: ${userQuery}`;
+    const prompt = `You are AI, a smart, slightly witty AI assistant. Keep responses short and conversational. User: ${userQuery}`;
 
     // ✅ Gemini call
     const result = await model.generateContent(prompt);
@@ -103,7 +103,7 @@ app.post("/alexa", async (req, res) => {
 
 // Health check
 app.get("/", (req, res) => {
-  res.send("Jarvis API Running 🚀");
+  res.send("AI mode is active. API Running 🚀");
 });
 
 const port = process.env.PORT || 3000;
