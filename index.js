@@ -96,7 +96,7 @@ Respond to the latest user message.
 
     // 🤖 Groq call (FAST 🔥)
     const completion = await groq.chat.completions.create({
-      model: "llama-3.1-8b-instant",
+      model: "grok-4.20-reasoning",
       messages: [
         { role: "system", content: "You are a smart AI assistant." },
         { role: "user", content: prompt },
