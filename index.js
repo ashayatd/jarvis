@@ -1,6 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Groq from "groq-sdk";
 
 dotenv.config();
 
@@ -8,16 +8,15 @@ dotenv.config();
 const log = (...args) => console.log("[LOG]", ...args);
 const logError = (...args) => console.error("[ERROR]", ...args);
 
-// Gemini setup
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({
-  model: "gemini-flash-latest",
+// ✅ Groq setup
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
 
 const app = express();
 app.use(express.json());
 
-// 🧠 Simple in-memory conversation
+// 🧠 Memory
 let chatHistory = [];
 
 // Log requests
@@ -32,9 +31,8 @@ app.post("/alexa", async (req, res) => {
     log("REQUEST BODY:", JSON.stringify(req.body, null, 2));
 
     const requestType = req.body.request?.type;
-    const intentName = req.body.request?.intent?.name;
 
-    // ✅ Launch Request
+    // ✅ Launch
     if (requestType === "LaunchRequest") {
       return res.json({
         version: "1.0",
@@ -48,7 +46,7 @@ app.post("/alexa", async (req, res) => {
       });
     }
 
-    // 🧠 Extract user query (handle fallback too)
+    // 🧠 Extract query
     let userQuery =
       req.body.request?.intent?.slots?.query?.value ||
       req.body.request?.inputTranscript ||
@@ -58,7 +56,7 @@ app.post("/alexa", async (req, res) => {
 
     const lower = userQuery.toLowerCase();
 
-    // 🚪 Exit command
+    // 🚪 Exit
     if (
       lower.includes("exit") ||
       lower.includes("stop") ||
@@ -79,10 +77,9 @@ app.post("/alexa", async (req, res) => {
       });
     }
 
-    // 🧠 Add to memory
+    // 🧠 Memory add
     chatHistory.push(`User: ${userQuery}`);
 
-    // 🧠 Prompt with context
     const prompt = `
 You are AI mode, a smart, slightly witty assistant.
 
@@ -91,20 +88,28 @@ ${chatHistory.join("\n")}
 
 Rules:
 - Be short and conversational
-- If user says things like "I choose 1", understand based on previous response
+- Understand references like "I choose 1"
 - Maintain context
 
 Respond to the latest user message.
 `;
 
-    // 🤖 Gemini call
-    const result = await model.generateContent(prompt);
+    // 🤖 Groq call (FAST 🔥)
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      messages: [
+        { role: "system", content: "You are a smart AI assistant." },
+        { role: "user", content: prompt },
+      ],
+    });
+
     const reply =
-      result.response.text() || "Sorry, I didn't get that.";
+      completion.choices[0]?.message?.content ||
+      "Sorry, I didn't get that.";
 
     log("AI Reply:", reply);
 
-    // 🧠 Save AI response
+    // 🧠 Save response
     chatHistory.push(`AI: ${reply}`);
 
     return res.json({
@@ -118,7 +123,7 @@ Respond to the latest user message.
       },
     });
   } catch (error) {
-    logError("Error in /alexa handler:", error);
+    logError("Error:", error);
 
     return res.json({
       version: "1.0",
@@ -133,9 +138,9 @@ Respond to the latest user message.
   }
 });
 
-// Health check
+// Health
 app.get("/", (req, res) => {
-  res.send("AI mode is active. API Running 🚀");
+  res.send("AI mode running with Groq 🚀");
 });
 
 const port = process.env.PORT || 3000;
