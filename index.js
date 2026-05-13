@@ -8,7 +8,7 @@ dotenv.config();
 const log = (...args) => console.log("[LOG]", ...args);
 const logError = (...args) => console.error("[ERROR]", ...args);
 
-consolo.log(
+console.log(
   "Starting AI mode with Groq...",
   "GROQ_API_KEY:",
   process.env.GROQ_API_KEY,
