@@ -31,6 +31,29 @@ app.use((req, res, next) => {
 });
 
 app.post("/alexa", async (req, res) => {
+      // Handle 'open vs code' command BEFORE AI call
+      if (lower.includes("open vs code")) {
+        await fetch("https://saturnina-preoceanic-domenica.ngrok-free.dev/execute", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            command: "open_vscode",
+          }),
+        });
+
+        return res.json({
+          version: "1.0",
+          response: {
+            outputSpeech: {
+              type: "PlainText",
+              text: "Opening Visual Studio Code",
+            },
+            shouldEndSession: false,
+          },
+        });
+      }
   try {
     log("/alexa endpoint hit");
     log("REQUEST BODY:", JSON.stringify(req.body, null, 2));
