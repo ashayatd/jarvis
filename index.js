@@ -8,6 +8,11 @@ dotenv.config();
 const log = (...args) => console.log("[LOG]", ...args);
 const logError = (...args) => console.error("[ERROR]", ...args);
 
+consolo.log(
+  "Starting AI mode with Groq...",
+  "GROQ_API_KEY:",
+  process.env.GROQ_API_KEY,
+);
 // ✅ Groq setup
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
@@ -104,8 +109,7 @@ Respond to the latest user message.
     });
 
     const reply =
-      completion.choices[0]?.message?.content ||
-      "Sorry, I didn't get that.";
+      completion.choices[0]?.message?.content || "Sorry, I didn't get that.";
 
     log("AI Reply:", reply);
 
