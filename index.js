@@ -51,6 +51,8 @@ app.post("/alexa", async (req, res) => {
       });
     }
 
+    log("Intent JSON:", JSON.stringify(req.body.request?.intent, null, 2));
+
     // 🧠 Extract query
     let userQuery =
       req.body.request?.intent?.slots?.query?.value ||
