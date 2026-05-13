@@ -4,63 +4,53 @@ import Groq from "groq-sdk";
 
 dotenv.config();
 
-// Logging
+// =========================
+// Logging Helpers
+// =========================
 const log = (...args) => console.log("[LOG]", ...args);
 const logError = (...args) => console.error("[ERROR]", ...args);
 
-console.log(
-  "Starting AI mode with Groq...",
-  "GROQ_API_KEY:",
-  process.env.GROQ_API_KEY,
-);
-// ✅ Groq setup
+// =========================
+// Groq Setup
+// =========================
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
+log("AI mode starting with Groq...");
+
+// =========================
+// Express Setup
+// =========================
 const app = express();
 app.use(express.json());
 
-// 🧠 Memory
+// =========================
+// Simple Memory
+// =========================
 let chatHistory = [];
 
-// Log requests
+// =========================
+// Request Logger
+// =========================
 app.use((req, res, next) => {
   log(`Incoming ${req.method} ${req.url}`);
   next();
 });
 
+// =========================
+// Alexa Endpoint
+// =========================
 app.post("/alexa", async (req, res) => {
-      // Handle 'open vs code' command BEFORE AI call
-      if (lower.includes("open vs code")) {
-        await fetch("https://saturnina-preoceanic-domenica.ngrok-free.dev/execute", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            command: "open_vscode",
-          }),
-        });
-
-        return res.json({
-          version: "1.0",
-          response: {
-            outputSpeech: {
-              type: "PlainText",
-              text: "Opening Visual Studio Code",
-            },
-            shouldEndSession: false,
-          },
-        });
-      }
   try {
     log("/alexa endpoint hit");
     log("REQUEST BODY:", JSON.stringify(req.body, null, 2));
 
     const requestType = req.body.request?.type;
 
-    // ✅ Launch
+    // =========================
+    // Launch Request
+    // =========================
     if (requestType === "LaunchRequest") {
       return res.json({
         version: "1.0",
@@ -74,19 +64,28 @@ app.post("/alexa", async (req, res) => {
       });
     }
 
-    log("Intent JSON:", JSON.stringify(req.body.request?.intent, null, 2));
+    // =========================
+    // Extract User Query
+    // =========================
+    const slots = req.body.request?.intent?.slots || {};
 
-    // 🧠 Extract query
-    let userQuery =
-      req.body.request?.intent?.slots?.query?.value ||
-      req.body.request?.inputTranscript ||
-      "Hello";
+    let userQuery = Object.values(slots)[0]?.value;
+
+    if (!userQuery) {
+      userQuery = req.body.request?.inputTranscript;
+    }
+
+    if (!userQuery) {
+      userQuery = "Hello";
+    }
 
     log("User Query:", userQuery);
 
     const lower = userQuery.toLowerCase();
 
-    // 🚪 Exit
+    // =========================
+    // Exit AI Mode
+    // =========================
     if (
       lower.includes("exit") ||
       lower.includes("stop") ||
@@ -107,7 +106,53 @@ app.post("/alexa", async (req, res) => {
       });
     }
 
-    // 🔄 Topic reset
+    // =========================
+    // VS Code Automation
+    // =========================
+    if (lower.includes("open vs code")) {
+      try {
+        await fetch(
+          "https://saturnina-preoceanic-domenica.ngrok-free.dev/execute",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              command: "open_vscode",
+            }),
+          },
+        );
+
+        return res.json({
+          version: "1.0",
+          response: {
+            outputSpeech: {
+              type: "PlainText",
+              text: "Opening Visual Studio Code",
+            },
+            shouldEndSession: false,
+          },
+        });
+      } catch (err) {
+        logError("VS Code automation failed:", err);
+
+        return res.json({
+          version: "1.0",
+          response: {
+            outputSpeech: {
+              type: "PlainText",
+              text: "I could not open Visual Studio Code",
+            },
+            shouldEndSession: false,
+          },
+        });
+      }
+    }
+
+    // =========================
+    // Topic Reset
+    // =========================
     if (
       lower.includes("new topic") ||
       lower.includes("don't want to continue") ||
@@ -119,9 +164,14 @@ app.post("/alexa", async (req, res) => {
       chatHistory = [];
     }
 
-    // 🧠 Save USER message
+    // =========================
+    // Save User Message
+    // =========================
     chatHistory.push(`User: ${userQuery}`);
 
+    // =========================
+    // Prompt
+    // =========================
     const prompt = `
 You are AI mode, a smart and conversational assistant.
 
@@ -143,13 +193,24 @@ Important behavior rules:
 
 Respond naturally to the latest user message only.
 `;
-    // 🤖 Groq call (FAST 🔥)
+
+    // =========================
+    // AI Call
+    // =========================
     const completion = await groq.chat.completions.create({
       model: "llama-3.1-8b-instant",
       messages: [
-        { role: "system", content: "You are a smart AI assistant." },
-        { role: "user", content: prompt },
+        {
+          role: "system",
+          content: "You are a smart AI assistant.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
       ],
+      temperature: 0.7,
+      max_tokens: 120,
     });
 
     const reply =
@@ -157,19 +218,21 @@ Respond naturally to the latest user message only.
 
     log("AI Reply:", reply);
 
-    // 🔄 Topic reset
-    if (
-      lower.includes("new topic") ||
-      lower.includes("don't want to continue") ||
-      lower.includes("forget that") ||
-      lower.includes("something else")
-    ) {
-      chatHistory = [];
+    // =========================
+    // Save AI Reply
+    // =========================
+    chatHistory.push(`AI: ${reply}`);
+
+    // =========================
+    // Prevent Infinite Memory Growth
+    // =========================
+    if (chatHistory.length > 20) {
+      chatHistory = chatHistory.slice(-20);
     }
 
-    // 🧠 Save USER message
-    chatHistory.push(`User: ${userQuery}`);
-
+    // =========================
+    // Final Alexa Response
+    // =========================
     return res.json({
       version: "1.0",
       response: {
@@ -181,7 +244,7 @@ Respond naturally to the latest user message only.
       },
     });
   } catch (error) {
-    logError("Error:", error);
+    logError("Error in /alexa:", error);
 
     return res.json({
       version: "1.0",
@@ -196,12 +259,18 @@ Respond naturally to the latest user message only.
   }
 });
 
-// Health
+// =========================
+// Health Check
+// =========================
 app.get("/", (req, res) => {
   res.send("AI mode running with Groq 🚀");
 });
 
+// =========================
+// Server Start
+// =========================
 const port = process.env.PORT || 3000;
+
 app.listen(port, () => {
   log(`Server running on port ${port}`);
 });
