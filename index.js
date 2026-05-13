@@ -68,6 +68,7 @@ app.post("/alexa", async (req, res) => {
     // Extract User Query
     // =========================
     const slots = req.body.request?.intent?.slots || {};
+    log("Extracted Slots:", JSON.stringify(slots, null, 2));
 
     let userQuery = Object.values(slots)[0]?.value;
 
@@ -76,7 +77,16 @@ app.post("/alexa", async (req, res) => {
     }
 
     if (!userQuery) {
-      userQuery = "Hello";
+      return res.json({
+        version: "1.0",
+        response: {
+          outputSpeech: {
+            type: "PlainText",
+            text: "I didn't catch that properly. Please say tell me followed by your question.",
+          },
+          shouldEndSession: false,
+        },
+      });
     }
 
     log("User Query:", userQuery);
