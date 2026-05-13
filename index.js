@@ -82,23 +82,42 @@ app.post("/alexa", async (req, res) => {
       });
     }
 
-    // 🧠 Memory add
+    // 🔄 Topic reset
+    if (
+      lower.includes("new topic") ||
+      lower.includes("don't want to continue") ||
+      lower.includes("forget that") ||
+      lower.includes("something else") ||
+      lower.includes("change topic") ||
+      lower.includes("another topic")
+    ) {
+      chatHistory = [];
+    }
+
+    // 🧠 Save USER message
     chatHistory.push(`User: ${userQuery}`);
 
     const prompt = `
-You are AI mode, a smart, slightly witty assistant.
+You are AI mode, a smart and conversational assistant.
 
-Conversation so far:
+Conversation history:
 ${chatHistory.join("\n")}
 
-Rules:
-- Be short and conversational
+Important behavior rules:
+- Maintain conversational context naturally
+- If the user changes topic, immediately switch topics
+- Never force old topics into new conversations
+- If the user says things like:
+  "forget that",
+  "new topic",
+  "let's talk about something else",
+  "I don't want to continue"
+  then stop using previous topic context
+- Keep responses short and voice-friendly for Alexa
 - Understand references like "I choose 1"
-- Maintain context
 
-Respond to the latest user message.
+Respond naturally to the latest user message only.
 `;
-
     // 🤖 Groq call (FAST 🔥)
     const completion = await groq.chat.completions.create({
       model: "llama-3.1-8b-instant",
@@ -113,8 +132,18 @@ Respond to the latest user message.
 
     log("AI Reply:", reply);
 
-    // 🧠 Save response
-    chatHistory.push(`AI: ${reply}`);
+    // 🔄 Topic reset
+    if (
+      lower.includes("new topic") ||
+      lower.includes("don't want to continue") ||
+      lower.includes("forget that") ||
+      lower.includes("something else")
+    ) {
+      chatHistory = [];
+    }
+
+    // 🧠 Save USER message
+    chatHistory.push(`User: ${userQuery}`);
 
     return res.json({
       version: "1.0",
