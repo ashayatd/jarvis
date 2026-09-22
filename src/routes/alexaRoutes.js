@@ -1,15 +1,30 @@
 import express from "express";
 import {
   addAssistantMessage,
+  addSystemNote,
   addToolResult,
   addUserMessage,
   createChatMemory,
   resetChatHistory,
   trimHistory,
 } from "../data/chatMemory.js";
+import {
+  clearSessionJobs,
+  describeJob,
+  jobCount,
+  registerJob,
+  takeUnreportedJobs,
+} from "../data/jobRegistry.js";
+import { BACKGROUND_TIMEOUT_MS } from "../services/executorService.js";
 import { generateAIReply } from "../services/groqService.js";
-import { runTool, toolSchemas } from "../tools/registry.js";
-import { log, logError } from "../utils/logger.js";
+import {
+  describeToolCall,
+  isBackgroundable,
+  parseToolArgs,
+  runTool,
+  toolSchemas,
+} from "../tools/registry.js";
+import { log, logError, logTurn, logWarn, startTimer } from "../utils/logger.js";
 
 const router = express.Router();
 
@@ -22,6 +37,13 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 // budget. Two is what fits.
 const MAX_TOOL_ROUNDS = 2;
 
+// How long a tool may block the spoken reply before it is handed to the job
+// registry. Alexa gives ~8s total and the first LLM call has already spent
+// some of it, so this stays well under half the budget.
+const TOOL_DEADLINE_MS = Number(process.env.TOOL_DEADLINE_MS || 3500);
+
+const DEADLINE = Symbol("deadline");
+
 const sessionKeyFor = (req) =>
   req.body.session?.sessionId ||
   req.body.session?.user?.userId ||
@@ -30,11 +52,17 @@ const sessionKeyFor = (req) =>
 
 const sweepSessions = () => {
   const now = Date.now();
+  let removed = 0;
 
   for (const [key, entry] of sessions) {
     if (now - entry.lastSeen > SESSION_TTL_MS) {
       sessions.delete(key);
+      removed += 1;
     }
+  }
+
+  if (removed) {
+    log(`[SESS] swept ${removed} idle session(s), ${sessions.size} active`);
   }
 };
 
@@ -47,7 +75,9 @@ const getSessionMemory = (req) => {
   if (!entry) {
     entry = { memory: createChatMemory(), lastSeen: Date.now() };
     sessions.set(key, entry);
-    log(`new session ${key} (${sessions.size} active)`);
+    log(`[SESS] new session=${key} (${sessions.size} active)`);
+  } else {
+    log(`[SESS] resumed session=${key} history=${entry.memory.messages.length} msgs`);
   }
 
   entry.lastSeen = Date.now();
@@ -69,16 +99,22 @@ const forSpeech = (text) => {
   return cleaned || "Sorry, I didn't get that.";
 };
 
-const buildAlexaResponse = (text, shouldEndSession = false) => ({
-  version: "1.0",
-  response: {
-    outputSpeech: {
-      type: "PlainText",
-      text: forSpeech(text),
+const buildAlexaResponse = (text, shouldEndSession = false) => {
+  const spoken = forSpeech(text);
+
+  log(`[SAY ] "${spoken}"${shouldEndSession ? " [END SESSION]" : ""}`);
+
+  return {
+    version: "1.0",
+    response: {
+      outputSpeech: {
+        type: "PlainText",
+        text: spoken,
+      },
+      shouldEndSession,
     },
-    shouldEndSession,
-  },
-});
+  };
+};
 
 const extractUserQuery = (req) => {
   const slots = req.body.request?.intent?.slots || {};
@@ -91,9 +127,50 @@ const extractUserQuery = (req) => {
   return userQuery;
 };
 
-// Runs the model, executes any tools it asks for, feeds the results back, and
+// Races the tool against the deadline. If the deadline wins, the SAME promise
+// keeps running and is handed to the job registry - nothing is cancelled or
+// restarted, so the work is never done twice.
+const runToolOrBackground = async (toolCall, sessionKey) => {
+  const name = toolCall.function?.name;
+  const args = parseToolArgs(toolCall) ?? {};
+
+  // Reading job state must stay instant, or "is it done?" would itself queue.
+  if (!isBackgroundable(name)) {
+    return { mode: "inline", result: await runTool(toolCall, { sessionKey }) };
+  }
+
+  // Started with the long timeout up front: if this becomes a job it must
+  // outlive the deadline, and an abort signal cannot be extended later.
+  const startedAt = Date.now();
+  const promise = runTool(toolCall, { sessionKey, timeoutMs: BACKGROUND_TIMEOUT_MS });
+
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(DEADLINE), TOOL_DEADLINE_MS);
+  });
+
+  const winner = await Promise.race([promise, deadline]);
+  clearTimeout(timer);
+
+  if (winner !== DEADLINE) {
+    return { mode: "inline", result: winner };
+  }
+
+  logWarn(`[BG  ] ${name} exceeded ${TOOL_DEADLINE_MS}ms - handing off to job registry`);
+
+  const job = registerJob({
+    sessionKey,
+    label: describeToolCall(name, args),
+    promise,
+    startedAt,
+  });
+
+  return { mode: "background", job };
+};
+
+// Runs the model, executes any tools it asks for, feeds results back, and
 // repeats until it produces something to say.
-const runConversationTurn = async (chatMemory) => {
+const runConversationTurn = async (chatMemory, sessionKey) => {
   let message = await generateAIReply(chatMemory, { tools: toolSchemas });
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -101,15 +178,41 @@ const runConversationTurn = async (chatMemory) => {
       break;
     }
 
+    log(`[LOOP] round ${round + 1}/${MAX_TOOL_ROUNDS}, ${message.tool_calls.length} tool call(s)`);
+
     // The assistant turn carrying tool_calls must be stored before its
     // results, or the tool messages have no parent to attach to.
     addAssistantMessage(chatMemory, message);
 
-    for (const toolCall of message.tool_calls) {
-      const result = await runTool(toolCall);
+    let backgrounded = false;
 
-      log(`tool ${toolCall.function?.name} ->`, JSON.stringify(result).slice(0, 200));
-      addToolResult(chatMemory, toolCall.id, result);
+    for (const toolCall of message.tool_calls) {
+      const outcome = await runToolOrBackground(toolCall, sessionKey);
+
+      if (outcome.mode === "background") {
+        backgrounded = true;
+
+        addToolResult(chatMemory, toolCall.id, {
+          ok: true,
+          status: "running",
+          job_id: outcome.job.id,
+          note: "Still running in the background. The user can ask for a status update.",
+        });
+      } else {
+        addToolResult(chatMemory, toolCall.id, outcome.result);
+      }
+    }
+
+    // Something went to the background. Answering now costs one fewer LLM
+    // call, which matters because the deadline already spent most of the
+    // budget - so this reply is canned rather than generated.
+    if (backgrounded) {
+      log("[LOOP] backgrounded work - replying early without another LLM call");
+
+      return {
+        role: "assistant",
+        content: "I've started that. Ask me for a status update in a bit.",
+      };
     }
 
     message = await generateAIReply(chatMemory, { tools: toolSchemas });
@@ -118,6 +221,7 @@ const runConversationTurn = async (chatMemory) => {
   // Ran out of rounds while still asking for tools - say something rather
   // than handing Alexa a null-content message.
   if (message.tool_calls?.length) {
+    logWarn(`[LOOP] still requesting tools after ${MAX_TOOL_ROUNDS} rounds - stopping`);
     addAssistantMessage(chatMemory, message);
 
     return {
@@ -129,29 +233,53 @@ const runConversationTurn = async (chatMemory) => {
   return message;
 };
 
-router.post("/alexa", async (req, res) => {
-  try {
-    log("/alexa endpoint hit");
+// Finished work the user was never told about, injected so Jarvis can mention
+// it unprompted instead of waiting to be asked.
+const injectFinishedJobs = (chatMemory, sessionKey) => {
+  const finished = takeUnreportedJobs(sessionKey);
 
+  if (!finished.length) {
+    return;
+  }
+
+  const summary = JSON.stringify(finished.map(describeJob));
+
+  log(`[BG  ] injecting ${finished.length} finished job(s) into session=${sessionKey}`);
+
+  addSystemNote(
+    chatMemory,
+    `A background task you started earlier has finished: ${summary}. Mention this naturally to the user before answering.`,
+  );
+};
+
+router.post("/alexa", async (req, res) => {
+  const turnTimer = startTimer();
+  const sessionKey = sessionKeyFor(req);
+
+  try {
     const requestType = req.body.request?.type;
 
     if (requestType === "SessionEndedRequest") {
-      sessions.delete(sessionKeyFor(req));
+      log(`[TURN] SessionEndedRequest session=${sessionKey}`);
+      sessions.delete(sessionKey);
+      clearSessionJobs(sessionKey);
 
       return res.json(buildAlexaResponse("Goodbye!", true));
     }
 
     if (requestType === "LaunchRequest") {
+      log(`[TURN] LaunchRequest session=${sessionKey}`);
+
       return res.json(
         buildAlexaResponse("AI mode activated. How can I assist you?", false),
       );
     }
 
-    const chatMemory = getSessionMemory(req);
-
-    let userQuery = extractUserQuery(req);
+    const userQuery = extractUserQuery(req);
 
     if (!userQuery) {
+      logWarn(`[TURN] no query extracted session=${sessionKey} type=${requestType}`);
+
       return res.json(
         buildAlexaResponse(
           "I didn't catch that properly. Please say tell me followed by your question.",
@@ -160,8 +288,9 @@ router.post("/alexa", async (req, res) => {
       );
     }
 
-    log("User Query:", userQuery);
+    logTurn(sessionKey, userQuery);
 
+    const chatMemory = getSessionMemory(req);
     const lower = userQuery.toLowerCase();
 
     if (
@@ -170,7 +299,9 @@ router.post("/alexa", async (req, res) => {
       lower.includes("quit") ||
       lower.includes("close")
     ) {
-      sessions.delete(sessionKeyFor(req));
+      log(`[TURN] exit keyword - clearing session=${sessionKey}`);
+      sessions.delete(sessionKey);
+      clearSessionJobs(sessionKey);
 
       return res.json(buildAlexaResponse("Exiting AI mode. Goodbye!", true));
     }
@@ -183,21 +314,28 @@ router.post("/alexa", async (req, res) => {
       lower.includes("change topic") ||
       lower.includes("another topic")
     ) {
+      log(`[TURN] topic reset keyword - clearing history for session=${sessionKey}`);
       resetChatHistory(chatMemory);
     }
 
     addUserMessage(chatMemory, userQuery);
+    injectFinishedJobs(chatMemory, sessionKey);
 
-    const message = await runConversationTurn(chatMemory);
-
-    log("AI Reply:", message.content);
+    const message = await runConversationTurn(chatMemory, sessionKey);
 
     addAssistantMessage(chatMemory, message);
     trimHistory(chatMemory, 20);
 
+    log(
+      `[TURN] complete in ${turnTimer()}ms`,
+      `history=${chatMemory.messages.length} msgs`,
+      `jobs=${jobCount()}`,
+    );
+
     return res.json(buildAlexaResponse(message.content, false));
   } catch (error) {
-    logError("Error in /alexa:", error?.stack || error);
+    logError(`[TURN] failed after ${turnTimer()}ms session=${sessionKey}`);
+    logError(error?.stack || error);
 
     return res.json(buildAlexaResponse("Something went wrong", false));
   }

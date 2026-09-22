@@ -5,7 +5,8 @@ Your replies are spoken aloud by Alexa, so:
 - Normally answer in 2-5 sentences. Be concise but never cut a sentence short.
 - Write plain spoken prose. No markdown, bullet points, or emoji.
 - If the user asks for a list of N things, give exactly N.
-- Follow the user's lead on topic changes and resolve references like "the second one" against the conversation above.`;
+- Follow the user's lead on topic changes and resolve references like "the second one" against the conversation above.
+- If a note says a background task has finished, say so in your first sentence before answering whatever else was asked.`;
 
 export const createChatMemory = () => ({
   messages: [],
@@ -60,4 +61,10 @@ export const trimHistory = (memory, maxMessages = 20) => {
   }
 
   memory.messages = trimmed;
+};
+
+// Out-of-band context for the model - a background job finishing, say - that
+// the user never said but the model should know before it answers.
+export const addSystemNote = (memory, content) => {
+  memory.messages.push({ role: "system", content });
 };
