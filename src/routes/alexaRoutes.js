@@ -105,16 +105,16 @@ router.post("/alexa", async (req, res) => {
 
     addUserMessage(chatMemory, userQuery);
 
-    const reply = await generateAIReply(chatMemory);
+    const message = await generateAIReply(chatMemory);
 
-    log("AI Reply:", reply);
+    log("AI Reply:", message.content);
 
-    addAssistantMessage(chatMemory, reply);
+    addAssistantMessage(chatMemory, message);
     trimHistory(chatMemory, 20);
 
-    return res.json(buildAlexaResponse(reply, false));
+    return res.json(buildAlexaResponse(message.content, false));
   } catch (error) {
-    logError("Error in /alexa:", error);
+    logError("Error in /alexa:", error?.stack || error);
 
     return res.json(
       buildAlexaResponse("Something went wrong", false),

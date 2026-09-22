@@ -1,5 +1,7 @@
 import Groq from "groq-sdk";
-import { buildConversationPrompt } from "../data/chatMemory.js";
+import { buildMessages } from "../data/chatMemory.js";
+
+const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
 let groqClient = null;
 
@@ -19,50 +21,26 @@ const getGroqClient = () => {
   return groqClient;
 };
 
+// Returns the full assistant message so a reply carrying tool_calls survives
+// to the caller. Speak `.content`; store the whole object in memory.
 export const generateAIReply = async (chatMemory) => {
   const groq = getGroqClient();
 
-//   const completion = await groq.chat.completions.create({
-//     model: "openai/gpt-oss-20b",
-//     messages: [
-//       {
-//         role: "system",
-//         content: "You are a smart AI assistant.",
-//       },
-//       {
-//         role: "user",
-//         content: buildConversationPrompt(chatMemory),
-//       },
-//     ],
-//     temperature: 0.7,
-//     max_tokens: 120,
-//   });
+  const completion = await groq.chat.completions.create({
+    model: MODEL,
+    messages: buildMessages(chatMemory),
+    temperature: 0.7,
+    max_tokens: 300,
+  });
 
-const completion = await groq.chat.completions.create({
-  model: "openai/gpt-oss-20b",
-  messages: [
-    {
-      role: "system",
-      content: `
-            You are AI mode, a smart and conversational voice assistant.
+  const message = completion.choices[0]?.message;
 
-            Rules:
-            - Answer the user's actual question.
-            - Keep answers concise but complete.
-            - Do not cut sentences short.
-            - Since the response will be spoken by Alexa, avoid very long answers.
-            - Normally answer in 2-5 sentences.
-            - If the user asks for a list, provide the requested number of items.
-      `,
-    },
-    {
-      role: "user",
-      content: prompt,
-    },
-  ],
-  temperature: 0.7,
-  max_tokens: 300,
-});
+  if (!message) {
+    return { role: "assistant", content: "Sorry, I didn't get that." };
+  }
 
-  return completion.choices[0]?.message?.content || "Sorry, I didn't get that.";
+  return {
+    ...message,
+    content: message.content?.trim() || "Sorry, I didn't get that.",
+  };
 };
