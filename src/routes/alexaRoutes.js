@@ -44,6 +44,22 @@ const TOOL_DEADLINE_MS = Number(process.env.TOOL_DEADLINE_MS || 3500);
 
 const DEADLINE = Symbol("deadline");
 
+// Spoken only if the user goes quiet with the mic still open.
+const REPROMPT_TEXT = "I'm listening.";
+
+// Matched exactly, not by substring, so "thanks for that, now open vs code"
+// stays a normal turn.
+const FAREWELLS = new Set(["thank you", "thanks"]);
+
+// Punctuation and case removed so "Thank you!" matches. Used only for the
+// farewell comparison.
+const normalizeForFarewell = (text) =>
+  text
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, "")
+    .replace(/ +/g, " ")
+    .trim();
+
 const sessionKeyFor = (req) =>
   req.body.session?.sessionId ||
   req.body.session?.user?.userId ||
@@ -102,17 +118,31 @@ const forSpeech = (text) => {
 const buildAlexaResponse = (text, shouldEndSession = false) => {
   const spoken = forSpeech(text);
 
-  log(`[SAY ] "${spoken}"${shouldEndSession ? " [END SESSION]" : ""}`);
+  log(`[SAY ] "${spoken}"${shouldEndSession ? " [END SESSION]" : " [MIC OPEN]"}`);
+
+  const response = {
+    outputSpeech: {
+      type: "PlainText",
+      text: spoken,
+    },
+    shouldEndSession,
+  };
+
+  // Without a reprompt Alexa closes the mic after speaking, forcing the skill
+  // to be re-invoked every turn. It is spoken only if the user stays silent.
+  // Pointless once the session is ending, so it is left off there.
+  if (!shouldEndSession) {
+    response.reprompt = {
+      outputSpeech: {
+        type: "PlainText",
+        text: REPROMPT_TEXT,
+      },
+    };
+  }
 
   return {
     version: "1.0",
-    response: {
-      outputSpeech: {
-        type: "PlainText",
-        text: spoken,
-      },
-      shouldEndSession,
-    },
+    response,
   };
 };
 
@@ -289,6 +319,14 @@ router.post("/alexa", async (req, res) => {
     }
 
     logTurn(sessionKey, userQuery);
+
+    if (FAREWELLS.has(normalizeForFarewell(userQuery))) {
+      log(`[TURN] farewell - closing session=${sessionKey}`);
+      sessions.delete(sessionKey);
+      clearSessionJobs(sessionKey);
+
+      return res.json(buildAlexaResponse("You're welcome, goodbye!", true));
+    }
 
     const chatMemory = getSessionMemory(req);
     const lower = userQuery.toLowerCase();
