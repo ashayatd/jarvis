@@ -23,12 +23,13 @@ const getGroqClient = () => {
 
 // Returns the full assistant message so a reply carrying tool_calls survives
 // to the caller. Speak `.content`; store the whole object in memory.
-export const generateAIReply = async (chatMemory) => {
+export const generateAIReply = async (chatMemory, { tools } = {}) => {
   const groq = getGroqClient();
 
   const completion = await groq.chat.completions.create({
     model: MODEL,
     messages: buildMessages(chatMemory),
+    ...(tools?.length ? { tools, tool_choice: "auto" } : {}),
     temperature: 0.7,
     max_tokens: 300,
   });
@@ -37,6 +38,12 @@ export const generateAIReply = async (chatMemory) => {
 
   if (!message) {
     return { role: "assistant", content: "Sorry, I didn't get that." };
+  }
+
+  // A tool_calls reply has null content by design - it is a request to act,
+  // not something to speak. Only fall back when there is nothing at all.
+  if (message.tool_calls?.length) {
+    return { ...message, content: message.content?.trim() || null };
   }
 
   return {
