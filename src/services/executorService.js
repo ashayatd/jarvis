@@ -1,8 +1,11 @@
 import { log, logError, preview, startTimer } from "../utils/logger.js";
 
+// EXECUTOR_URL is the current name; VSCODE_AUTOMATION_URL is still read so an
+// older .env keeps working.
 const EXECUTOR_URL =
+  process.env.EXECUTOR_URL ||
   process.env.VSCODE_AUTOMATION_URL ||
-  "https://saturnina-preoceanic-domenica.ngrok-free.dev/execute";
+  "http://127.0.0.1:5000/execute";
 
 // Inline work has to fit Alexa's ~8s budget; a backgrounded job does not, so
 // the ceiling is per call rather than global.
