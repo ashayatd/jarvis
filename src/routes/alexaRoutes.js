@@ -49,11 +49,26 @@ const REPROMPT_TEXT = "I'm listening.";
 
 // Matched exactly, not by substring, so "thanks for that, now open vs code"
 // stays a normal turn.
-const FAREWELLS = new Set(["thank you", "thanks"]);
+const FAREWELLS = new Set([
+  "thank you",
+  "thanks",
+  "thanks a lot",
+  "thank you very much",
+]);
 
-// Punctuation and case removed so "Thank you!" matches. Used only for the
-// farewell comparison.
-const normalizeForFarewell = (text) =>
+// Also exact, for the same reason: substring matching killed the session on
+// ordinary commands like "close vs code" or "stop the build".
+const EXIT_PHRASES = new Set([
+  "exit",
+  "stop",
+  "goodbye",
+  "exit ai mode",
+  "quit",
+]);
+
+// Punctuation and case removed so "Thank you!" matches. Used for both exact
+// match lists.
+const normalizePhrase = (text) =>
   text
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, "")
@@ -320,7 +335,9 @@ router.post("/alexa", async (req, res) => {
 
     logTurn(sessionKey, userQuery);
 
-    if (FAREWELLS.has(normalizeForFarewell(userQuery))) {
+    const normalized = normalizePhrase(userQuery);
+
+    if (FAREWELLS.has(normalized)) {
       log(`[TURN] farewell - closing session=${sessionKey}`);
       sessions.delete(sessionKey);
       clearSessionJobs(sessionKey);
@@ -328,21 +345,16 @@ router.post("/alexa", async (req, res) => {
       return res.json(buildAlexaResponse("You're welcome, goodbye!", true));
     }
 
-    const chatMemory = getSessionMemory(req);
-    const lower = userQuery.toLowerCase();
-
-    if (
-      lower.includes("exit") ||
-      lower.includes("stop") ||
-      lower.includes("quit") ||
-      lower.includes("close")
-    ) {
-      log(`[TURN] exit keyword - clearing session=${sessionKey}`);
+    if (EXIT_PHRASES.has(normalized)) {
+      log(`[TURN] exit phrase - clearing session=${sessionKey}`);
       sessions.delete(sessionKey);
       clearSessionJobs(sessionKey);
 
       return res.json(buildAlexaResponse("Exiting AI mode. Goodbye!", true));
     }
+
+    const chatMemory = getSessionMemory(req);
+    const lower = userQuery.toLowerCase();
 
     if (
       lower.includes("new topic") ||
