@@ -298,7 +298,7 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
 
       return {
         role: "assistant",
-        content: `That will run ${gated.command}. Say yes to confirm.`,
+        content: gated.prompt ?? `That will run ${gated.command}. Say yes to confirm.`,
         pendingAction: gated,
       };
     }

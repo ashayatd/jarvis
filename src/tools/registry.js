@@ -6,15 +6,15 @@ import {
 } from "../services/executorService.js";
 import { log, logError, preview, startTimer } from "../utils/logger.js";
 
-// Spoken app names -> the command your PC agent actually receives.
-// Only `open_vscode` is confirmed to exist on the agent today; the rest need
-// matching handlers added there before they will work.
+// Spoken app names -> the command your PC agent actually receives. None of
+// these have handlers on the agent yet; they need adding there before they
+// will work.
+//
+// VS Code is deliberately absent. It is opened through open_project, which
+// needs a project name, so there is no tool that can drop the user into the
+// workspace root - which is what makes step one of the workflow structural
+// rather than something the prompt has to be trusted to remember.
 const APP_COMMANDS = {
-  "vscode": "open_vscode",
-  "vs code": "open_vscode",
-  "visual studio code": "open_vscode",
-  "code": "open_vscode",
-  "editor": "open_vscode",
   "chrome": "open_chrome",
   "browser": "open_chrome",
   "terminal": "open_terminal",
@@ -70,41 +70,28 @@ const isAllowed = (command) => {
 };
 
 // What has to be confirmed before this tool call may run, or null if it can
-// go straight through. A command carrying metacharacters is left to the
-// handler to refuse outright - it is not something to offer the user.
+// go straight through. The policy lives on each tool as `confirm`, so a tool
+// and the rule that gates it cannot drift apart. A tool with no `confirm`
+// never gates.
 //
-// This and the handler below have to agree on the order of these checks, or
-// the gate holds a command the handler would have run anyway.
+// `prompt` is what the user hears. A tool that leaves it out gets the default
+// "That will run X" wording; one that sets it asks its own question, which is
+// how the VS Code flow gets to ask about initialising a repo instead.
 export const confirmationFor = (toolCall) => {
-  const name = toolCall?.function?.name;
+  const tool = TOOLS[toolCall?.function?.name];
   const args = parseToolArgs(toolCall);
 
-  // Every Claude CLI run edits files, so the prompt is always read back
-  // before it goes anywhere.
-  if (name === "run_claude") {
-    const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";
-
-    return prompt ? { command: `Claude with: ${prompt}`, toolCall } : null;
-  }
-
-  if (name !== "run_command") {
+  if (!tool?.confirm || args === null) {
     return null;
   }
 
-  const command = typeof args?.command === "string" ? args.command.trim() : "";
+  try {
+    const held = tool.confirm(args);
 
-  if (!command || hasShellMetacharacters(command)) {
+    return held ? { ...held, toolCall } : null;
+  } catch {
     return null;
   }
-
-  // Read-only commands skip the gate even when they match a mutating prefix.
-  // "git status" is on the allowlist for a reason - making the user confirm
-  // it turns every status check into two turns for nothing.
-  if (isAllowed(command) || !isMutating(command)) {
-    return null;
-  }
-
-  return { command, toolCall };
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -197,6 +184,24 @@ const TOOLS = {
   run_command: {
     backgroundable: true,
     describe: (args) => `run "${args.command ?? "a command"}"`,
+    // Read-only commands skip the gate even when they match a mutating
+    // prefix: "git status" is on the allowlist for a reason, and making the
+    // user confirm it turns every status check into two turns for nothing.
+    // The handler below checks these in the same order - if they disagreed,
+    // the gate would hold a command the handler was going to run anyway.
+    confirm: ({ command }) => {
+      const wanted = typeof command === "string" ? command.trim() : "";
+
+      if (!wanted || hasShellMetacharacters(wanted)) {
+        return null;
+      }
+
+      if (isAllowed(wanted) || !isMutating(wanted)) {
+        return null;
+      }
+
+      return { command: wanted };
+    },
     schema: {
       type: "function",
       function: {
@@ -267,6 +272,12 @@ const TOOLS = {
   run_claude: {
     backgroundable: true,
     describe: (args) => `ask Claude to ${args.prompt ?? "do something"}`,
+    // Every Claude run edits files, so the prompt is always read back first.
+    confirm: ({ prompt }) => {
+      const wanted = typeof prompt === "string" ? prompt.trim() : "";
+
+      return wanted ? { command: `Claude with: ${wanted}` } : null;
+    },
     schema: {
       type: "function",
       function: {
@@ -314,6 +325,119 @@ const TOOLS = {
           : JSON.stringify(result).slice(0, 800);
 
       return { ok: true, prompt: instruction, output };
+    },
+  },
+
+  check_directory: {
+    // Never a job: the whole point is that the assistant can ask "which
+    // project?" and act on the answer inside one spoken turn.
+    backgroundable: false,
+    describe: (args) => `check for ${args.project ?? "a project"}`,
+    schema: {
+      type: "function",
+      function: {
+        name: "check_directory",
+        description:
+          "Check whether a project folder already exists in the user's workspace. Always call this before opening or creating a project. It is instant, read-only and needs no confirmation. It also returns the projects that do exist, so you can offer them if the name was misheard.",
+        parameters: {
+          type: "object",
+          properties: {
+            project: {
+              type: "string",
+              description:
+                "The project name as the user said it, e.g. 'landing page'. Spaces are fine - it is matched against the folder names on disk.",
+            },
+          },
+          required: ["project"],
+        },
+      },
+    },
+    handler: async ({ project }, { timeoutMs }) => {
+      if (!project) {
+        return { ok: false, error: "No project name given." };
+      }
+
+      return execute("check_directory", { project }, { timeoutMs });
+    },
+  },
+
+  open_project: {
+    backgroundable: true,
+    describe: (args) => `open ${args.project ?? "a project"} in VS Code`,
+    schema: {
+      type: "function",
+      function: {
+        name: "open_project",
+        description:
+          "Open an existing project from the user's workspace in VS Code. Only call this after check_directory has confirmed the folder exists. This is the only way to open VS Code - there is no tool that opens the workspace root, so if the user has not named a project yet, ask them which one.",
+        parameters: {
+          type: "object",
+          properties: {
+            project: {
+              type: "string",
+              description: "The project name, as passed to check_directory.",
+            },
+          },
+          required: ["project"],
+        },
+      },
+    },
+    handler: async ({ project }, { timeoutMs }) => {
+      if (!project) {
+        return { ok: false, error: "No project name given." };
+      }
+
+      return execute("open_project", { project }, { timeoutMs });
+    },
+  },
+
+  init_project: {
+    backgroundable: true,
+    describe: (args) => `start ${args.project ?? "a project"}`,
+    // Creates a directory and a repo, so it is gated - but with its own
+    // question, because "that project isn't present, should I initialise a
+    // new repo?" is the confirmation here. Asking in prose as well would make
+    // the user say yes twice.
+    confirm: ({ project }) => {
+      const wanted = typeof project === "string" ? project.trim() : "";
+
+      return wanted
+        ? {
+            command: `git init in ${wanted}`,
+            prompt: "That project isn't present. Should I initialize a new repo?",
+          }
+        : null;
+    },
+    schema: {
+      type: "function",
+      function: {
+        name: "init_project",
+        description:
+          "Create a new project folder in the user's workspace, run git init inside it and open it in VS Code. Call this when check_directory reports the project does not exist. Do not ask in prose whether to create it first - the user is asked to confirm automatically, so asking yourself would make them confirm twice.",
+        parameters: {
+          type: "object",
+          properties: {
+            project: {
+              type: "string",
+              description: "The project name, as passed to check_directory.",
+            },
+          },
+          required: ["project"],
+        },
+      },
+    },
+    handler: async ({ project }, { timeoutMs, confirmed = false }) => {
+      if (!project) {
+        return { ok: false, error: "No project name given." };
+      }
+
+      if (!confirmed) {
+        logError(`[TOOL] BLOCKED, unconfirmed init: ${preview(project, 120)}`);
+
+        return { ok: false, error: "The user has not confirmed this yet." };
+      }
+
+      return execute("init_project", { project }, { timeoutMs });
     },
   },
 

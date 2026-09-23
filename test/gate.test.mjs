@@ -10,6 +10,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { after, before, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -27,10 +29,16 @@ process.env.EXECUTOR_SECRET = SECRET;
 // prompt arrived unmangled.
 process.env.EXECUTOR_CLAUDE_BIN = process.execPath;
 
-// Overrides the real workspace: the suite should not touch it, and the
-// read-only git test wants a directory that is actually a repo. Set here
-// because executor.py reads .env, where this is also configured.
-process.env.EXECUTOR_WORKDIR = root;
+// A throwaway workspace: these tests create folders and repos, and must not
+// touch the real one. Set here rather than in the spawn env because
+// executor.py reads .env, where this is also configured, and an existing
+// environment variable is what wins over it.
+const workspace = path.join(os.tmpdir(), `jarvis-test-workspace-${process.pid}`);
+fs.mkdirSync(path.join(workspace, "landing-page"), { recursive: true });
+process.env.EXECUTOR_WORKDIR = workspace;
+
+// Stops a real editor window opening for every case that reaches VS Code.
+process.env.EXECUTOR_VSCODE_BIN = "cmd /c echo";
 
 // One scripted assistant reply is consumed per generateAIReply call.
 const scripted = [];
@@ -95,6 +103,7 @@ before(async () => {
 after(() => {
   server?.close();
   executor?.kill();
+  fs.rmSync(workspace, { recursive: true, force: true });
 });
 
 const say = async (sessionId, text) => {
@@ -228,4 +237,98 @@ test("an unconfirmed Claude run is refused by the handler too", async () => {
 
   assert.equal(result.ok, false);
   assert.match(result.error, /not confirmed/);
+});
+
+// --- the VS Code project workflow ----------------------------------------
+
+test("no tool can open VS Code without a project", async () => {
+  const { toolSchemas } = await import("../src/tools/registry.js");
+  const names = toolSchemas.map((schema) => schema.function.name);
+
+  assert.ok(names.includes("open_project"));
+
+  // open_app is the tool that would have dropped the user into the workspace
+  // root. It must no longer know what VS Code is.
+  const openApp = toolSchemas.find((schema) => schema.function.name === "open_app");
+  assert.doesNotMatch(openApp.function.parameters.properties.app.description, /vs ?code/i);
+});
+
+test("check_directory finds an existing project", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "check_directory", arguments: JSON.stringify({ project: "landing page" }) } },
+    {},
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.exists, true);
+  assert.equal(result.project, "landing-page");
+});
+
+test("check_directory reports a missing project and lists what there is", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "check_directory", arguments: JSON.stringify({ project: "invoice tracker" }) } },
+    {},
+  );
+
+  assert.equal(result.exists, false);
+  assert.deepEqual(result.projects, ["landing-page"]);
+});
+
+test("a project name cannot climb out of the workspace", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "check_directory", arguments: JSON.stringify({ project: "../../Windows/System32" }) } },
+    {},
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(path.dirname(result.path), workspace);
+});
+
+test("open_project refuses a folder that is not there", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "open_project", arguments: JSON.stringify({ project: "nothing here" }) } },
+    {},
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.exists, false);
+});
+
+test("open_project opens an existing folder with no confirmation", async () => {
+  scripted.push(toolCall("open_project", { project: "landing page" }));
+  scripted.push({ role: "assistant", content: "Landing page is open." });
+  const r = await say("v1", "landing page");
+
+  assert.equal(r.text, "Landing page is open.");
+});
+
+test("init_project asks its own question rather than the default wording", async () => {
+  scripted.push(toolCall("init_project", { project: "invoice tracker" }));
+  const r = await say("v2", "invoice tracker");
+
+  assert.equal(r.text, "That project isn't present. Should I initialize a new repo?");
+  assert.equal(r.end, false);
+});
+
+test("confirming creates the folder, the repo and opens it", async () => {
+  const r = await say("v2", "yes");
+
+  assert.doesNotMatch(r.text, /not confirmed|didn't work/);
+  assert.ok(fs.existsSync(path.join(workspace, "invoice-tracker", ".git")));
+});
+
+test("an unconfirmed init is refused by the handler too", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "init_project", arguments: JSON.stringify({ project: "sneaky" }) } },
+    {},
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not confirmed/);
+  assert.ok(!fs.existsSync(path.join(workspace, "sneaky")));
 });

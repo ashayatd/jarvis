@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -66,6 +67,10 @@ def _resolve_claude():
 
 CLAUDE_BIN = _resolve_claude()
 
+# Overridable so the tests can exercise the open/init flow without a real
+# editor window appearing for every case.
+VSCODE_BIN = os.environ.get("EXECUTOR_VSCODE_BIN", "code")
+
 # Finished jobs are kept only long enough for the caller to read them back.
 JOB_TTL_S = 30 * 60
 
@@ -74,6 +79,58 @@ MAX_OUTPUT_CHARS = 4000
 
 _jobs = {}
 _jobs_lock = threading.Lock()
+
+
+# Spoken project names arrive as "landing page", while the folder on disk is
+# "landing-page". Everything that is not a letter or digit becomes a hyphen,
+# which also strips separators and dots - so a name can never climb out of the
+# workspace, whatever the model was told to pass.
+def _slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower()).strip("-")
+
+
+def _list_projects():
+    try:
+        return sorted(
+            entry for entry in os.listdir(WORKDIR)
+            if os.path.isdir(os.path.join(WORKDIR, entry))
+        )
+    except OSError:
+        return []
+
+
+def _project_path(name):
+    """Resolve a spoken name to (folder, existing_path_or_None) inside WORKDIR.
+
+    A folder is also matched when its name only slugifies to the same thing,
+    so "landing page" finds an existing "Landing Page" or "landingPage"
+    instead of quietly creating a second directory beside it.
+    """
+    slug = _slug(name)
+
+    if not slug:
+        return None, None
+
+    direct = os.path.join(WORKDIR, slug)
+
+    # _slug cannot emit a separator, so this cannot fail - it is here so that
+    # a future change to _slug cannot silently open a traversal.
+    if os.path.dirname(os.path.abspath(direct)) != os.path.abspath(WORKDIR):
+        print(f"[EXEC] REFUSED project name outside workspace: {name}")
+        return None, None
+
+    if os.path.isdir(direct):
+        return slug, direct
+
+    for entry in _list_projects():
+        if _slug(entry) == slug:
+            return entry, os.path.join(WORKDIR, entry)
+
+    return slug, None
+
+
+def _launch_vscode(path):
+    subprocess.run(f'{VSCODE_BIN} "{path}"', shell=True, cwd=path)
 
 
 def _sweep_jobs():
@@ -185,7 +242,7 @@ def execute():
     if command == "open_vscode":
         # The path is passed explicitly rather than relying on ".", so the
         # window lands on the workspace no matter where this was started from.
-        subprocess.run(f'code "{WORKDIR}"', shell=True, cwd=WORKDIR)
+        _launch_vscode(WORKDIR)
         return jsonify({"ok": True, "output": f"VS Code launched on {WORKDIR}."})
 
     if command == "run_command":
@@ -232,6 +289,87 @@ def execute():
         return jsonify(
             {"ok": True, "status": "running", "job_id": _start_job(shell_command, use_shell=True)}
         )
+
+    # Deliberately instant and read-only: this is what lets the assistant ask
+    # "which project?" and act on the answer inside one spoken turn.
+    if command == "check_directory":
+        folder, path = _project_path(data.get("args", {}).get("project", ""))
+
+        if not folder:
+            return jsonify({"ok": False, "error": "No usable project name provided."}), 400
+
+        return jsonify({
+            "ok": True,
+            "exists": path is not None,
+            "project": folder,
+            "path": path or os.path.join(WORKDIR, folder),
+            "projects": _list_projects()[:20],
+        })
+
+    if command == "open_project":
+        folder, path = _project_path(data.get("args", {}).get("project", ""))
+
+        if not folder:
+            return jsonify({"ok": False, "error": "No usable project name provided."}), 400
+
+        # A missing folder is an ordinary outcome, not a protocol error, so it
+        # comes back 200 for the model to handle rather than as an exception.
+        if path is None:
+            return jsonify({
+                "ok": False,
+                "exists": False,
+                "error": f"There is no '{folder}' in the workspace.",
+                "projects": _list_projects()[:20],
+            })
+
+        _launch_vscode(path)
+        print(f"[EXEC] opened {path}")
+
+        return jsonify({"ok": True, "project": folder, "output": f"Opened {folder} in VS Code."})
+
+    if command == "init_project":
+        folder, path = _project_path(data.get("args", {}).get("project", ""))
+
+        if not folder:
+            return jsonify({"ok": False, "error": "No usable project name provided."}), 400
+
+        created = path is None
+
+        if created:
+            path = os.path.join(WORKDIR, folder)
+            os.makedirs(path, exist_ok=True)
+            print(f"[EXEC] created {path}")
+
+        try:
+            git = subprocess.run(
+                ["git", "init"],
+                cwd=path,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return jsonify({"ok": False, "error": "git is not installed or not on PATH."})
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "error": "git init timed out."})
+
+        if git.returncode != 0:
+            return jsonify({
+                "ok": False,
+                "error": (git.stderr.strip() or f"git init exited with {git.returncode}."),
+            })
+
+        _launch_vscode(path)
+
+        return jsonify({
+            "ok": True,
+            "project": folder,
+            "created": created,
+            "output": f"Created {folder}, initialised a git repo in it and opened it in VS Code."
+            if created
+            else f"{folder} already existed. Initialised a git repo in it and opened it in VS Code.",
+        })
 
     # No shell anywhere on this path. The prompt goes to the CLI as one argv
     # entry, so $, (), quotes and newlines in it are plain text - there is no
@@ -282,6 +420,7 @@ def execute():
 if __name__ == '__main__':
     print(f"[EXEC] workdir: {WORKDIR}")
     print(f"[EXEC] claude : {CLAUDE_BIN}")
+    print(f"[EXEC] vscode : {VSCODE_BIN}")
     # threaded is the default, but it is the thing that makes job_status
     # answerable while a job is still running, so it is set explicitly.
     app.run(port=int(os.environ.get("EXECUTOR_PORT", "5000")), threaded=True)
