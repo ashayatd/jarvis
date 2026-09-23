@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -17,6 +18,35 @@ WORKDIR = os.environ.get("EXECUTOR_WORKDIR") or os.path.dirname(os.path.abspath(
 # A `claude -p "..."` run is minutes, not seconds. Nothing that long may hold a
 # Flask worker, so it runs in a thread and the caller polls job_status.
 JOB_TIMEOUT_S = int(os.environ.get("EXECUTOR_JOB_TIMEOUT", "900"))
+
+
+def _resolve_claude():
+    """Absolute path to the Claude CLI.
+
+    PATH is not enough: this is often started from a shell or a service that
+    never sourced the profile that adds the install directory, so the usual
+    location is checked too.
+    """
+    override = os.environ.get("EXECUTOR_CLAUDE_BIN")
+
+    if override:
+        return override
+
+    found = shutil.which("claude")
+
+    if found:
+        return found
+
+    for name in ("claude.exe", "claude"):
+        candidate = os.path.join(os.path.expanduser("~"), ".local", "bin", name)
+
+        if os.path.isfile(candidate):
+            return candidate
+
+    return "claude"
+
+
+CLAUDE_BIN = _resolve_claude()
 
 # Finished jobs are kept only long enough for the caller to read them back.
 JOB_TTL_S = 30 * 60
@@ -57,14 +87,14 @@ def _finish(job_id, status, **fields):
         job.update(fields)
 
 
-def _run_job(job_id, shell_command):
+def _run_job(job_id, command, use_shell, label):
     started = time.time()
-    print(f"[EXEC] {job_id} running: {shell_command}")
+    print(f"[EXEC] {job_id} running: {label}")
 
     try:
         result = subprocess.run(
-            shell_command,
-            shell=True,
+            command,
+            shell=use_shell,
             capture_output=True,
             text=True,
             timeout=JOB_TIMEOUT_S,
@@ -77,7 +107,11 @@ def _run_job(job_id, shell_command):
         )
     except subprocess.TimeoutExpired:
         print(f"[EXEC] {job_id} timed out after {JOB_TIMEOUT_S}s")
-        _finish(job_id, "failed", error=f"'{shell_command}' timed out after {JOB_TIMEOUT_S} seconds.")
+        _finish(job_id, "failed", error=f"'{label}' timed out after {JOB_TIMEOUT_S} seconds.")
+        return
+    except FileNotFoundError:
+        print(f"[EXEC] {job_id} not found: {command[0] if isinstance(command, list) else command}")
+        _finish(job_id, "failed", error=f"'{label}' could not be started - is the command installed?")
         return
     except Exception as error:  # noqa: BLE001 - the thread must never die silently
         print(f"[EXEC] {job_id} failed to start: {error}")
@@ -96,25 +130,28 @@ def _run_job(job_id, shell_command):
             "failed",
             output=output,
             returncode=result.returncode,
-            error=f"'{shell_command}' exited with code {result.returncode}.",
+            error=f"'{label}' exited with code {result.returncode}.",
         )
 
 
-def _start_job(shell_command):
+def _start_job(command, use_shell=True, label=None):
     _sweep_jobs()
 
     job_id = f"x{uuid.uuid4().hex[:8]}"
+    label = label or (command if isinstance(command, str) else " ".join(command))
 
     with _jobs_lock:
         _jobs[job_id] = {
             "status": "running",
-            "command": shell_command,
+            "command": label,
             "started_at": time.time(),
             "finished_at": None,
         }
 
     # Daemon, so a stuck job cannot keep the executor alive on shutdown.
-    threading.Thread(target=_run_job, args=(job_id, shell_command), daemon=True).start()
+    threading.Thread(
+        target=_run_job, args=(job_id, command, use_shell, label), daemon=True
+    ).start()
 
     return job_id
 
@@ -172,7 +209,26 @@ def execute():
         if not shell_command:
             return jsonify({"ok": False, "error": "No command provided."}), 400
 
-        return jsonify({"ok": True, "status": "running", "job_id": _start_job(shell_command)})
+        return jsonify(
+            {"ok": True, "status": "running", "job_id": _start_job(shell_command, use_shell=True)}
+        )
+
+    # No shell anywhere on this path. The prompt goes to the CLI as one argv
+    # entry, so $, (), quotes and newlines in it are plain text - there is no
+    # shell to interpret them and nothing to escape.
+    if command == "start_claude":
+        prompt = data.get("args", {}).get("prompt", "")
+
+        if not prompt:
+            return jsonify({"ok": False, "error": "No prompt provided."}), 400
+
+        job_id = _start_job(
+            [CLAUDE_BIN, "-p", prompt],
+            use_shell=False,
+            label=f"claude: {prompt}",
+        )
+
+        return jsonify({"ok": True, "status": "running", "job_id": job_id})
 
     if command == "job_status":
         job_id = data.get("args", {}).get("job_id", "")
@@ -205,6 +261,7 @@ def execute():
 
 if __name__ == '__main__':
     print(f"[EXEC] workdir: {WORKDIR}")
+    print(f"[EXEC] claude : {CLAUDE_BIN}")
     # threaded is the default, but it is the thing that makes job_status
     # answerable while a job is still running, so it is set explicitly.
-    app.run(port=5000, threaded=True)
+    app.run(port=int(os.environ.get("EXECUTOR_PORT", "5000")), threaded=True)

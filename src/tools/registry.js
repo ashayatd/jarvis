@@ -72,15 +72,35 @@ const isAllowed = (command) => {
 // What has to be confirmed before this tool call may run, or null if it can
 // go straight through. A command carrying metacharacters is left to the
 // handler to refuse outright - it is not something to offer the user.
+//
+// This and the handler below have to agree on the order of these checks, or
+// the gate holds a command the handler would have run anyway.
 export const confirmationFor = (toolCall) => {
-  if (toolCall?.function?.name !== "run_command") {
+  const name = toolCall?.function?.name;
+  const args = parseToolArgs(toolCall);
+
+  // Every Claude CLI run edits files, so the prompt is always read back
+  // before it goes anywhere.
+  if (name === "run_claude") {
+    const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";
+
+    return prompt ? { command: `Claude with: ${prompt}`, toolCall } : null;
+  }
+
+  if (name !== "run_command") {
     return null;
   }
 
-  const args = parseToolArgs(toolCall);
   const command = typeof args?.command === "string" ? args.command.trim() : "";
 
-  if (!command || hasShellMetacharacters(command) || !isMutating(command)) {
+  if (!command || hasShellMetacharacters(command)) {
+    return null;
+  }
+
+  // Read-only commands skip the gate even when they match a mutating prefix.
+  // "git status" is on the allowlist for a reason - making the user confirm
+  // it turns every status check into two turns for nothing.
+  if (isAllowed(command) || !isMutating(command)) {
     return null;
   }
 
@@ -100,15 +120,15 @@ const POLL_INTERVAL_MS = 2000;
 // single HTTP request has to stay open that long - this polls until it lands.
 // The waiting happens inside the tool promise, which the job registry is
 // already built to hold onto after the spoken reply has gone out.
-const runRemoteJob = async (command) => {
-  const started = await execute("start_command", { command }, { timeoutMs: INLINE_TIMEOUT_MS });
+const runRemoteJob = async (startCommand, args, label) => {
+  const started = await execute(startCommand, args, { timeoutMs: INLINE_TIMEOUT_MS });
   const remoteId = started?.job_id;
 
   if (!remoteId) {
-    return { ok: false, error: `Executor did not start "${command}".` };
+    return { ok: false, error: `Executor did not start "${label}".` };
   }
 
-  log(`[TOOL] remote job ${remoteId} started for "${preview(command, 80)}"`);
+  log(`[TOOL] remote job ${remoteId} started for "${preview(label, 80)}"`);
 
   const deadline = Date.now() + REMOTE_JOB_TIMEOUT_MS;
   let wait = FIRST_POLL_MS;
@@ -126,7 +146,7 @@ const runRemoteJob = async (command) => {
 
   return {
     ok: false,
-    error: `"${command}" is still running after ${Math.round(REMOTE_JOB_TIMEOUT_MS / 60000)} minutes.`,
+    error: `"${label}" is still running after ${Math.round(REMOTE_JOB_TIMEOUT_MS / 60000)} minutes.`,
   };
 };
 
@@ -182,7 +202,7 @@ const TOOLS = {
       function: {
         name: "run_command",
         description:
-          `Run a command on the user's PC and return its output. These run straight away: ${ALLOWED_COMMANDS.join(", ")}. Commands starting with ${MUTATING_PREFIXES.map((prefix) => prefix.trim()).join(", ")} are allowed too, but the user is asked to confirm them out loud first - call the tool as normal and the confirmation is handled for you. Hand coding and file edits to the Claude CLI as claude -p "<instruction>". Nothing else is permitted, and commands may not be chained.`,
+          `Run a command on the user's PC and return its output. These run straight away: ${ALLOWED_COMMANDS.join(", ")}. Commands starting with ${MUTATING_PREFIXES.map((prefix) => prefix.trim()).join(", ")} are allowed too, but the user is asked to confirm them out loud first - call the tool as normal and the confirmation is handled for you. Do not use this for coding or file edits - that is what run_claude is for. Nothing else is permitted, and commands may not be chained.`,
         parameters: {
           type: "object",
           properties: {
@@ -212,9 +232,11 @@ const TOOLS = {
         };
       }
 
-      const mutating = isMutating(command);
+      // Allowlist first, so a read-only command runs instantly even though it
+      // matches a mutating prefix. Same order as confirmationFor.
+      const readOnly = isAllowed(command);
 
-      if (mutating ? !confirmed : !isAllowed(command)) {
+      if (!readOnly && !(isMutating(command) && confirmed)) {
         logError(`[TOOL] BLOCKED by allowlist: ${preview(command, 120)}`);
 
         return {
@@ -223,9 +245,9 @@ const TOOLS = {
         };
       }
 
-      const result = mutating
-        ? await runRemoteJob(command)
-        : await execute("run_command", { command }, { timeoutMs });
+      const result = readOnly
+        ? await execute("run_command", { command }, { timeoutMs })
+        : await runRemoteJob("start_command", { command }, command);
 
       if (result?.ok === false) {
         return result;
@@ -239,6 +261,59 @@ const TOOLS = {
           : JSON.stringify(result).slice(0, 800);
 
       return { ok: true, command, output };
+    },
+  },
+
+  run_claude: {
+    backgroundable: true,
+    describe: (args) => `ask Claude to ${args.prompt ?? "do something"}`,
+    schema: {
+      type: "function",
+      function: {
+        name: "run_claude",
+        description:
+          "Hand a coding or file-editing task to the Claude CLI on the user's PC. Use this for anything that writes, edits, refactors, explains or reviews code - it is the only tool that can change files. Pass the user's request as the prompt, in full and in plain English. The user is asked to confirm out loud before it runs, and the work takes minutes, so it usually finishes in the background.",
+        parameters: {
+          type: "object",
+          properties: {
+            prompt: {
+              type: "string",
+              description:
+                "The instruction for Claude, e.g. 'build a landing page with a signup form'. Write it out in full - Claude cannot see this conversation.",
+            },
+          },
+          required: ["prompt"],
+        },
+      },
+    },
+    // The prompt is passed as an argument, never as part of a command line,
+    // so it needs no allowlist and no metacharacter check: $ and () in a
+    // prompt are just text. Confirmation is what authorises it.
+    handler: async ({ prompt }, { confirmed = false }) => {
+      const instruction = typeof prompt === "string" ? prompt.trim() : "";
+
+      if (!instruction) {
+        return { ok: false, error: "No prompt given." };
+      }
+
+      if (!confirmed) {
+        logError(`[TOOL] BLOCKED, unconfirmed Claude run: ${preview(instruction, 120)}`);
+
+        return { ok: false, error: "The user has not confirmed this yet." };
+      }
+
+      const result = await runRemoteJob("start_claude", { prompt: instruction }, instruction);
+
+      if (result?.ok === false) {
+        return result;
+      }
+
+      const output =
+        typeof result?.output === "string"
+          ? result.output.slice(-800)
+          : JSON.stringify(result).slice(0, 800);
+
+      return { ok: true, prompt: instruction, output };
     },
   },
 
