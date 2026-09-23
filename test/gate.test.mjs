@@ -386,6 +386,30 @@ test("a fallback asks the user to repeat without teaching a carrier phrase", asy
   assert.match(r.text, /say it again/i);
 });
 
+test("a run of fallbacks escalates to advice that works on any model", async () => {
+  await sayIntent("b4b", "AMAZON.FallbackIntent");
+  const second = await sayIntent("b4b", "AMAZON.FallbackIntent");
+  const third = await sayIntent("b4b", "AMAZON.FallbackIntent");
+
+  // Repeating one useless line is the thing being complained about. The way
+  // out has to be offered, even though it is a workaround for a stale model.
+  assert.match(second.text, /tell me/i);
+  assert.match(third.text, /tell me/i);
+  assert.equal(second.end, false);
+});
+
+test("one understood utterance clears the streak", async () => {
+  await sayIntent("b4c", "AMAZON.FallbackIntent");
+  await sayIntent("b4c", "AMAZON.FallbackIntent");
+
+  scripted.push({ role: "assistant", content: "Understood." });
+  const good = await sayIntent("b4c", "AskIntent", { query: { name: "query", value: "what day is it" } });
+  assert.equal(good.text, "Understood.");
+
+  const afterwards = await sayIntent("b4c", "AMAZON.FallbackIntent");
+  assert.match(afterwards.text, /say it again/i);
+});
+
 // --- slot extraction ------------------------------------------------------
 
 test("an empty slot ahead of a filled one does not lose the utterance", async () => {

@@ -13,12 +13,16 @@ export const logWarn = (...args) => write(console.warn, "[WARN]", args);
 export const logError = (...args) => write(console.error, "[ERR ]", args);
 
 // Visually separates one Alexa turn from the next in a long scrollback.
-export const logTurn = (sessionKey, query) => {
+export const logTurn = (sessionKey, query, intent) => {
   console.log("");
   console.log(
     `${stamp()} ${"=".repeat(60)}`,
   );
-  console.log(`${stamp()} [TURN] session=${sessionKey} query="${query}"`);
+  console.log(
+    `${stamp()} [TURN] session=${sessionKey}`,
+    intent ? `intent=${intent}` : "",
+    `query="${query}"`,
+  );
 };
 
 // Returns a function that reports elapsed ms since creation.

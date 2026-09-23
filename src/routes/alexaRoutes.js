@@ -439,18 +439,31 @@ router.post("/alexa", async (req, res) => {
     const userQuery = extractUserQuery(req);
 
     // A fallback carries no transcript at all - the words are gone and cannot
-    // be recovered. Asking again is all that is left, and it must not tell the
-    // user to prefix anything: teaching the carrier phrase is what made this
-    // feel like it had to be said every time.
+    // be recovered here, so the only fix is in the interaction model. What can
+    // be done is to stop repeating one useless line: asking again is right
+    // once, but if it keeps happening the model is not matching and the user
+    // needs the one phrasing that always does. See alexa/README.md.
     if (!userQuery) {
-      logWarn(`[TURN] no query extracted session=${sessionKey} intent=${intentName ?? requestType}`);
+      const session = getSession(req);
+      session.fallbackStreak = (session.fallbackStreak ?? 0) + 1;
+
+      logWarn(
+        `[TURN] no query extracted session=${sessionKey}`,
+        `intent=${intentName ?? requestType}`,
+        `streak=${session.fallbackStreak}`,
+      );
 
       return res.json(
-        buildAlexaResponse("Sorry, I missed that. Could you say it again?", false),
+        buildAlexaResponse(
+          session.fallbackStreak === 1
+            ? "Sorry, I missed that. Could you say it again?"
+            : "I'm still not catching that. Try saying tell me, and then what you want.",
+          false,
+        ),
       );
     }
 
-    logTurn(sessionKey, userQuery);
+    logTurn(sessionKey, userQuery, intentName);
 
     const normalized = normalizePhrase(userQuery);
 
@@ -472,6 +485,9 @@ router.post("/alexa", async (req, res) => {
 
     const session = getSession(req);
     const chatMemory = session.memory;
+
+    // Something was understood, so the run of failures is over.
+    session.fallbackStreak = 0;
 
     // A pending command is answered on the very next turn or not at all, and
     // it is consumed either way: anything other than a plain yes drops it and

@@ -20,10 +20,6 @@
           "samples": []
         },
         {
-          "name": "AMAZON.FallbackIntent",
-          "samples": []
-        },
-        {
           "name": "AskIntent",
           "slots": [
             {
@@ -45,17 +41,137 @@
           "values": [
             {
               "name": {
+                "value": "thank you"
+              }
+            },
+            {
+              "name": {
+                "value": "thanks"
+              }
+            },
+            {
+              "name": {
+                "value": "thanks a lot"
+              }
+            },
+            {
+              "name": {
+                "value": "thank you very much"
+              }
+            },
+            {
+              "name": {
+                "value": "yes"
+              }
+            },
+            {
+              "name": {
+                "value": "yeah"
+              }
+            },
+            {
+              "name": {
+                "value": "yep"
+              }
+            },
+            {
+              "name": {
+                "value": "no"
+              }
+            },
+            {
+              "name": {
+                "value": "nope"
+              }
+            },
+            {
+              "name": {
+                "value": "okay"
+              }
+            },
+            {
+              "name": {
+                "value": "sure"
+              }
+            },
+            {
+              "name": {
+                "value": "do it"
+              }
+            },
+            {
+              "name": {
+                "value": "confirm"
+              }
+            },
+            {
+              "name": {
+                "value": "hello"
+              }
+            },
+            {
+              "name": {
+                "value": "hi there"
+              }
+            },
+            {
+              "name": {
+                "value": "goodbye"
+              }
+            },
+            {
+              "name": {
+                "value": "stop it"
+              }
+            },
+            {
+              "name": {
+                "value": "never mind"
+              }
+            },
+            {
+              "name": {
+                "value": "forget it"
+              }
+            },
+            {
+              "name": {
+                "value": "what"
+              }
+            },
+            {
+              "name": {
+                "value": "sorry"
+              }
+            },
+            {
+              "name": {
+                "value": "again"
+              }
+            },
+            {
+              "name": {
+                "value": "repeat that"
+              }
+            },
+            {
+              "name": {
+                "value": "go on"
+              }
+            },
+            {
+              "name": {
+                "value": "carry on"
+              }
+            },
+            {
+              "name": {
                 "value": "open vs code"
               }
             },
             {
               "name": {
-                "value": "open my landing page project"
-              }
-            },
-            {
-              "name": {
-                "value": "what is my git status"
+                "value": "git status"
               }
             },
             {
@@ -65,22 +181,97 @@
             },
             {
               "name": {
+                "value": "is it done yet"
+              }
+            },
+            {
+              "name": {
+                "value": "any updates"
+              }
+            },
+            {
+              "name": {
+                "value": "what time is it"
+              }
+            },
+            {
+              "name": {
+                "value": "who am i"
+              }
+            },
+            {
+              "name": {
+                "value": "what day is it"
+              }
+            },
+            {
+              "name": {
+                "value": "how are you"
+              }
+            },
+            {
+              "name": {
+                "value": "what can you do"
+              }
+            },
+            {
+              "name": {
+                "value": "help me out"
+              }
+            },
+            {
+              "name": {
+                "value": "list my projects"
+              }
+            },
+            {
+              "name": {
+                "value": "open my landing page"
+              }
+            },
+            {
+              "name": {
+                "value": "new project"
+              }
+            },
+            {
+              "name": {
+                "value": "start over"
+              }
+            },
+            {
+              "name": {
+                "value": "new topic"
+              }
+            },
+            {
+              "name": {
+                "value": "what is my git status"
+              }
+            },
+            {
+              "name": {
+                "value": "open my landing page project in vs code"
+              }
+            },
+            {
+              "name": {
                 "value": "start a new project called invoice tracker"
               }
             },
             {
               "name": {
-                "value": "initialize a new repo"
+                "value": "initialize a new repo for this project"
               }
             },
             {
               "name": {
-                "value": "commit my work"
+                "value": "commit my work with a sensible message"
               }
             },
             {
               "name": {
-                "value": "push my changes"
+                "value": "push my changes to the remote"
               }
             },
             {
@@ -105,7 +296,7 @@
             },
             {
               "name": {
-                "value": "explain what this error means"
+                "value": "explain what this error message means"
               }
             },
             {
@@ -120,47 +311,17 @@
             },
             {
               "name": {
-                "value": "is it done yet"
+                "value": "give me a status update on that job"
               }
             },
             {
               "name": {
-                "value": "give me a status update"
+                "value": "what happened with the last thing i asked for"
               }
             },
             {
               "name": {
-                "value": "what happened with that last job"
-              }
-            },
-            {
-              "name": {
-                "value": "what time is it"
-              }
-            },
-            {
-              "name": {
-                "value": "who am i"
-              }
-            },
-            {
-              "name": {
-                "value": "how much disk space do i have"
-              }
-            },
-            {
-              "name": {
-                "value": "what is the weather like today"
-              }
-            },
-            {
-              "name": {
-                "value": "tell me a joke"
-              }
-            },
-            {
-              "name": {
-                "value": "summarise what we just did"
+                "value": "summarise what we just did together"
               }
             },
             {
@@ -170,17 +331,37 @@
             },
             {
               "name": {
-                "value": "never mind that one"
+                "value": "how much disk space do i have left"
               }
             },
             {
               "name": {
-                "value": "yes do it"
+                "value": "what is the weather like today"
               }
             },
             {
               "name": {
-                "value": "no leave it alone"
+                "value": "tell me a joke about programmers"
+              }
+            },
+            {
+              "name": {
+                "value": "read me the last few commits"
+              }
+            },
+            {
+              "name": {
+                "value": "what branch am i on right now"
+              }
+            },
+            {
+              "name": {
+                "value": "make the header sticky on scroll"
+              }
+            },
+            {
+              "name": {
+                "value": "set up eslint and prettier in this project"
               }
             }
           ]

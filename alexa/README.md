@@ -25,6 +25,40 @@ varied phrases drawn from what this skill is actually used for. **If utterances
 start getting clipped after a couple of words, add more long examples to that
 list** — that is the knob to turn.
 
+## Why AMAZON.FallbackIntent is not in this model
+
+It used to be. It is left out on purpose, and adding it back will bring the
+problem straight back.
+
+`AMAZON.FallbackIntent` exists to catch "nothing matched". `AskIntent` is built
+to match everything. With both in the model they compete for every single
+utterance, and the short ones lose: "thank you" resembles none of the long
+example phrases, so Alexa scores it as a poor match and routes it to the
+fallback — which arrives at the service carrying **no transcript at all**. The
+words are gone before any code here runs. That is what produced this, on every
+turn:
+
+```
+[WARN] [TURN] no query extracted intent=AMAZON.FallbackIntent
+[SAY ] "Sorry, I missed that. Could you say it again?"
+```
+
+Without `AMAZON.FallbackIntent` in the model, those utterances have nowhere else
+to go and land in `AskIntent` with the text intact.
+
+If you would rather keep it — it is optional, not required for certification —
+then turn its sensitivity down instead, by adding this as a sibling of
+`intents` and `types`:
+
+```json
+"modelConfiguration": {
+  "fallbackIntentSensitivity": { "level": "LOW" }
+}
+```
+
+That reduces how eagerly it fires, but it does not eliminate the contention.
+Leaving the intent out is the reliable fix.
+
 ## Deploying it
 
 1. Alexa Developer Console → your skill → **Build** → **Interaction Model** →
@@ -35,6 +69,22 @@ list** — that is the knob to turn.
    than in the console, so the two stay in step.
 4. **Save Model**, then **Build Model**. Wait for the build to finish.
 5. Endpoint is unchanged — it still points at the tunnel to this service.
+
+## Checking whether it is actually live
+
+The service logs the intent name on every turn, which is the fastest way to
+tell a stale model from a real problem:
+
+- `intent=AskIntent` — the model is deployed and matching. Good.
+- `intent=AMAZON.FallbackIntent` — the utterance never reached `AskIntent`.
+  Either the build has not been deployed yet, or `AMAZON.FallbackIntent` is
+  still in the model. Check the console shows **Build Successful** for the
+  current model, then re-test.
+
+A run of fallbacks is answered with "try saying tell me, and then what you
+want" after the first one. That phrasing matches on the old model too, so it is
+a way out of the loop rather than a fix — if you are hearing it, the model
+above still needs deploying.
 
 ## What the service expects from it
 
