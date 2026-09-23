@@ -1,0 +1,191 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "ai mode",
+      "intents": [
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.NavigateHomeIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        },
+        {
+          "name": "AskIntent",
+          "slots": [
+            {
+              "name": "query",
+              "type": "CatchAllPhrase"
+            }
+          ],
+          "samples": [
+            "{query}",
+            "tell me {query}",
+            "ask {query}",
+            "say {query}"
+          ]
+        }
+      ],
+      "types": [
+        {
+          "name": "CatchAllPhrase",
+          "values": [
+            {
+              "name": {
+                "value": "open vs code"
+              }
+            },
+            {
+              "name": {
+                "value": "open my landing page project"
+              }
+            },
+            {
+              "name": {
+                "value": "what is my git status"
+              }
+            },
+            {
+              "name": {
+                "value": "what projects do i have"
+              }
+            },
+            {
+              "name": {
+                "value": "start a new project called invoice tracker"
+              }
+            },
+            {
+              "name": {
+                "value": "initialize a new repo"
+              }
+            },
+            {
+              "name": {
+                "value": "commit my work"
+              }
+            },
+            {
+              "name": {
+                "value": "push my changes"
+              }
+            },
+            {
+              "name": {
+                "value": "build a landing page with a signup form"
+              }
+            },
+            {
+              "name": {
+                "value": "create a new react app in this folder"
+              }
+            },
+            {
+              "name": {
+                "value": "add a dark mode toggle to the settings page"
+              }
+            },
+            {
+              "name": {
+                "value": "fix the failing test in the checkout flow"
+              }
+            },
+            {
+              "name": {
+                "value": "explain what this error means"
+              }
+            },
+            {
+              "name": {
+                "value": "refactor the auth service into smaller modules"
+              }
+            },
+            {
+              "name": {
+                "value": "write unit tests for the payment module"
+              }
+            },
+            {
+              "name": {
+                "value": "is it done yet"
+              }
+            },
+            {
+              "name": {
+                "value": "give me a status update"
+              }
+            },
+            {
+              "name": {
+                "value": "what happened with that last job"
+              }
+            },
+            {
+              "name": {
+                "value": "what time is it"
+              }
+            },
+            {
+              "name": {
+                "value": "who am i"
+              }
+            },
+            {
+              "name": {
+                "value": "how much disk space do i have"
+              }
+            },
+            {
+              "name": {
+                "value": "what is the weather like today"
+              }
+            },
+            {
+              "name": {
+                "value": "tell me a joke"
+              }
+            },
+            {
+              "name": {
+                "value": "summarise what we just did"
+              }
+            },
+            {
+              "name": {
+                "value": "forget that and start a new topic"
+              }
+            },
+            {
+              "name": {
+                "value": "never mind that one"
+              }
+            },
+            {
+              "name": {
+                "value": "yes do it"
+              }
+            },
+            {
+              "name": {
+                "value": "no leave it alone"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

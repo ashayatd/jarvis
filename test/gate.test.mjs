@@ -124,6 +124,29 @@ const say = async (sessionId, text) => {
   };
 };
 
+// Built-in intents carry a name and no slots, which is exactly the shape that
+// used to fall through to the "say tell me" message.
+const sayIntent = async (sessionId, intentName, slots) => {
+  const res = await fetch(base, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session: { sessionId },
+      request: {
+        type: "IntentRequest",
+        intent: { name: intentName, ...(slots ? { slots } : {}) },
+      },
+    }),
+  });
+
+  const body = await res.json();
+
+  return {
+    text: body.response.outputSpeech.text,
+    end: body.response.shouldEndSession,
+  };
+};
+
 const toolCall = (name, args) => ({
   role: "assistant",
   content: null,
@@ -331,4 +354,75 @@ test("an unconfirmed init is refused by the handler too", async () => {
   assert.equal(result.ok, false);
   assert.match(result.error, /not confirmed/);
   assert.ok(!fs.existsSync(path.join(workspace, "sneaky")));
+});
+
+// --- utterances that carry no query --------------------------------------
+
+test("AMAZON.StopIntent ends the session instead of asking for a carrier phrase", async () => {
+  const r = await sayIntent("b1", "AMAZON.StopIntent");
+
+  assert.equal(r.end, true);
+  assert.doesNotMatch(r.text, /tell me/i);
+});
+
+test("AMAZON.CancelIntent ends the session too", async () => {
+  const r = await sayIntent("b2", "AMAZON.CancelIntent");
+
+  assert.equal(r.end, true);
+});
+
+test("AMAZON.HelpIntent explains itself and keeps the mic open", async () => {
+  const r = await sayIntent("b3", "AMAZON.HelpIntent");
+
+  assert.equal(r.end, false);
+  assert.match(r.text, /open VS Code/);
+});
+
+test("a fallback asks the user to repeat without teaching a carrier phrase", async () => {
+  const r = await sayIntent("b4", "AMAZON.FallbackIntent");
+
+  assert.equal(r.end, false);
+  assert.doesNotMatch(r.text, /tell me/i);
+  assert.match(r.text, /say it again/i);
+});
+
+// --- slot extraction ------------------------------------------------------
+
+test("an empty slot ahead of a filled one does not lose the utterance", async () => {
+  scripted.push({ role: "assistant", content: "Got it." });
+
+  // The shape an intent with more than one slot actually sends: the unused
+  // slot is present but has no value, and it comes first.
+  const r = await sayIntent("b5", "AskIntent", {
+    carrier: { name: "carrier" },
+    query: { name: "query", value: "what is my git status" },
+  });
+
+  assert.equal(r.text, "Got it.");
+});
+
+// --- carrier phrases in the spoken text ----------------------------------
+
+test("a carrier phrase does not stop an exit phrase matching", async () => {
+  const r = await sayIntent("b6", "AskIntent", { query: { name: "query", value: "tell me stop" } });
+
+  assert.equal(r.end, true);
+});
+
+test("a carrier phrase does not stop a confirmation matching", async () => {
+  scripted.push(toolCall("init_project", { project: "carrier test" }));
+  const gated = await say("b7", "carrier test");
+  assert.match(gated.text, /Should I initialize a new repo/);
+
+  const r = await sayIntent("b7", "AskIntent", { query: { name: "query", value: "jarvis yes" } });
+  assert.doesNotMatch(r.text, /not confirmed/);
+  assert.ok(fs.existsSync(path.join(workspace, "carrier-test", ".git")));
+});
+
+test("a carrier phrase on a real question is still passed to the model", async () => {
+  scripted.push({ role: "assistant", content: "It is Tuesday." });
+  const r = await sayIntent("b8", "AskIntent", { query: { name: "query", value: "tell me what day it is" } });
+
+  assert.equal(r.end, false);
+  assert.equal(r.text, "It is Tuesday.");
 });

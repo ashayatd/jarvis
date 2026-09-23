@@ -67,19 +67,38 @@ const EXIT_PHRASES = new Set([
   "quit",
 ]);
 
+// Alexa's built-in intents arrive with no slots and no transcript, so they can
+// never produce a query. They have to be handled by name before extraction, or
+// every one of them falls through to the "I didn't catch that" branch - which
+// is why saying "stop" or "cancel" was answered with an instruction to say
+// "tell me" instead of ending the session.
+const BUILTIN_ENDINGS = new Set(["AMAZON.StopIntent", "AMAZON.CancelIntent"]);
+
+const HELP_TEXT =
+  "Ask me anything, or say open VS Code to work on a project. I can also run git commands and hand coding jobs to Claude. What would you like?";
+
 // Exact match again, and deliberately short: a confirmation has to be an
 // unambiguous yes and nothing else, because the next thing that happens is a
 // command running on the user's PC.
 const CONFIRMATIONS = new Set(["yes", "yeah", "yep", "do it", "confirm"]);
 
+// An interaction model with a bare {query} sample puts the whole utterance in
+// the slot, carrier phrase and all, so "tell me stop" arrives where "stop"
+// used to. Stripped only for the exact-match lists below - the model still
+// receives what the user actually said.
+const CARRIER_PHRASES = /^(?:ai mode|jarvis|alexa|computer|tell me|ask|say)\s+/;
+
 // Punctuation and case removed so "Thank you!" matches. Used for every exact
 // match list.
-const normalizePhrase = (text) =>
-  text
+const normalizePhrase = (text) => {
+  const cleaned = text
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, "")
     .replace(/ +/g, " ")
     .trim();
+
+  return cleaned.replace(CARRIER_PHRASES, "").trim() || cleaned;
+};
 
 const sessionKeyFor = (req) =>
   req.body.session?.sessionId ||
@@ -172,13 +191,13 @@ const buildAlexaResponse = (text, shouldEndSession = false) => {
 
 const extractUserQuery = (req) => {
   const slots = req.body.request?.intent?.slots || {};
-  let userQuery = Object.values(slots)[0]?.value;
 
-  if (!userQuery) {
-    userQuery = req.body.request?.inputTranscript;
-  }
+  // The first slot with a value, not simply the first slot: an intent with
+  // more than one slot leaves the unused ones present but empty, and picking
+  // blindly threw the utterance away whenever an empty one came back first.
+  const spoken = Object.values(slots).find((slot) => slot?.value)?.value;
 
-  return userQuery;
+  return spoken || req.body.request?.inputTranscript;
 };
 
 // Races the tool against the deadline. If the deadline wins, the SAME promise
@@ -399,16 +418,35 @@ router.post("/alexa", async (req, res) => {
       );
     }
 
+    const intentName = req.body.request?.intent?.name;
+
+    // "stop" and "cancel" are routed to built-ins by Alexa before any custom
+    // intent sees them, so this is the only place they can be caught.
+    if (BUILTIN_ENDINGS.has(intentName)) {
+      log(`[TURN] ${intentName} - closing session=${sessionKey}`);
+      sessions.delete(sessionKey);
+      clearSessionJobs(sessionKey);
+
+      return res.json(buildAlexaResponse("Goodbye!", true));
+    }
+
+    if (intentName === "AMAZON.HelpIntent") {
+      log(`[TURN] AMAZON.HelpIntent session=${sessionKey}`);
+
+      return res.json(buildAlexaResponse(HELP_TEXT, false));
+    }
+
     const userQuery = extractUserQuery(req);
 
+    // A fallback carries no transcript at all - the words are gone and cannot
+    // be recovered. Asking again is all that is left, and it must not tell the
+    // user to prefix anything: teaching the carrier phrase is what made this
+    // feel like it had to be said every time.
     if (!userQuery) {
-      logWarn(`[TURN] no query extracted session=${sessionKey} type=${requestType}`);
+      logWarn(`[TURN] no query extracted session=${sessionKey} intent=${intentName ?? requestType}`);
 
       return res.json(
-        buildAlexaResponse(
-          "I didn't catch that properly. Please say tell me followed by your question.",
-          false,
-        ),
+        buildAlexaResponse("Sorry, I missed that. Could you say it again?", false),
       );
     }
 
