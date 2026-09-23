@@ -1,5 +1,9 @@
 import { describeJob, getSessionJobs } from "../data/jobRegistry.js";
-import { execute, INLINE_TIMEOUT_MS } from "../services/executorService.js";
+import {
+  execute,
+  INLINE_TIMEOUT_MS,
+  REMOTE_JOB_TIMEOUT_MS,
+} from "../services/executorService.js";
 import { log, logError, preview, startTimer } from "../utils/logger.js";
 
 // Spoken app names -> the command your PC agent actually receives.
@@ -36,21 +40,94 @@ const ALLOWED_COMMANDS = [
   "npm -v",
 ];
 
+// Commands that change something: the repo, the installed packages, or files
+// on disk by way of the Claude CLI. These are never run on the model's word
+// alone - the user has to say yes out loud first. Prefix match, so "git "
+// gates every git subcommand, the read-only ones included.
+export const MUTATING_PREFIXES = ["git ", "npm ", "npx ", "claude "];
+
 // Chaining defeats prefix matching on its own: "git status && rm -rf ."
 // starts with an allowed prefix. Reject anything that could begin a second
-// command before the prefix check runs.
+// command before either the allowlist or the confirmation gate runs.
 const SHELL_METACHARACTERS = /[;&|<>`$()\x00-\x1f]/;
+
+const hasShellMetacharacters = (command) => SHELL_METACHARACTERS.test(command);
+
+// The trailing space makes a bare "git" match the "git " prefix, so the gate
+// cannot be stepped around by leaving the arguments off.
+const isMutating = (command) => {
+  const normalized = `${String(command ?? "").trim().toLowerCase()} `;
+
+  return MUTATING_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+};
 
 const isAllowed = (command) => {
   const normalized = command.trim().toLowerCase();
 
-  if (SHELL_METACHARACTERS.test(normalized)) {
-    return false;
-  }
-
   return ALLOWED_COMMANDS.some(
     (allowed) => normalized === allowed || normalized.startsWith(`${allowed} `),
   );
+};
+
+// What has to be confirmed before this tool call may run, or null if it can
+// go straight through. A command carrying metacharacters is left to the
+// handler to refuse outright - it is not something to offer the user.
+export const confirmationFor = (toolCall) => {
+  if (toolCall?.function?.name !== "run_command") {
+    return null;
+  }
+
+  const args = parseToolArgs(toolCall);
+  const command = typeof args?.command === "string" ? args.command.trim() : "";
+
+  if (!command || hasShellMetacharacters(command) || !isMutating(command)) {
+    return null;
+  }
+
+  return { command, toolCall };
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The first check comes quickly so a fast command (git status) still answers
+// inside Alexa's budget instead of being backgrounded by the poll interval
+// alone. After that there is no hurry.
+const FIRST_POLL_MS = 400;
+const POLL_INTERVAL_MS = 2000;
+
+// A confirmed command can be `claude -p "build a landing page"`, which runs
+// for minutes. The executor starts it in a thread and hands back an id, so no
+// single HTTP request has to stay open that long - this polls until it lands.
+// The waiting happens inside the tool promise, which the job registry is
+// already built to hold onto after the spoken reply has gone out.
+const runRemoteJob = async (command) => {
+  const started = await execute("start_command", { command }, { timeoutMs: INLINE_TIMEOUT_MS });
+  const remoteId = started?.job_id;
+
+  if (!remoteId) {
+    return { ok: false, error: `Executor did not start "${command}".` };
+  }
+
+  log(`[TOOL] remote job ${remoteId} started for "${preview(command, 80)}"`);
+
+  const deadline = Date.now() + REMOTE_JOB_TIMEOUT_MS;
+  let wait = FIRST_POLL_MS;
+
+  while (Date.now() < deadline) {
+    await sleep(wait);
+    wait = POLL_INTERVAL_MS;
+
+    const status = await execute("job_status", { job_id: remoteId }, { timeoutMs: INLINE_TIMEOUT_MS });
+
+    if (status?.status && status.status !== "running") {
+      return status;
+    }
+  }
+
+  return {
+    ok: false,
+    error: `"${command}" is still running after ${Math.round(REMOTE_JOB_TIMEOUT_MS / 60000)} minutes.`,
+  };
 };
 
 // Schema and handler live together so adding a tool is one object in one file.
@@ -105,7 +182,7 @@ const TOOLS = {
       function: {
         name: "run_command",
         description:
-          `Run a read-only command on the user's PC and return its output. Only these commands are permitted: ${ALLOWED_COMMANDS.join(", ")}. Do not attempt anything else.`,
+          `Run a command on the user's PC and return its output. These run straight away: ${ALLOWED_COMMANDS.join(", ")}. Commands starting with ${MUTATING_PREFIXES.map((prefix) => prefix.trim()).join(", ")} are allowed too, but the user is asked to confirm them out loud first - call the tool as normal and the confirmation is handled for you. Hand coding and file edits to the Claude CLI as claude -p "<instruction>". Nothing else is permitted, and commands may not be chained.`,
         parameters: {
           type: "object",
           properties: {
@@ -118,12 +195,26 @@ const TOOLS = {
         },
       },
     },
-    handler: async ({ command }, { timeoutMs }) => {
+    // `confirmed` is set only by the route handler, and only once the user has
+    // said yes to this exact command. It is the only way a mutating command
+    // reaches the executor.
+    handler: async ({ command }, { timeoutMs, confirmed = false }) => {
       if (!command) {
         return { ok: false, error: "No command given." };
       }
 
-      if (!isAllowed(command)) {
+      if (hasShellMetacharacters(command)) {
+        logError(`[TOOL] BLOCKED, shell metacharacters: ${preview(command, 120)}`);
+
+        return {
+          ok: false,
+          error: `"${command}" has shell characters I won't run. Ask for one plain command.`,
+        };
+      }
+
+      const mutating = isMutating(command);
+
+      if (mutating ? !confirmed : !isAllowed(command)) {
         logError(`[TOOL] BLOCKED by allowlist: ${preview(command, 120)}`);
 
         return {
@@ -132,7 +223,13 @@ const TOOLS = {
         };
       }
 
-      const result = await execute("run_command", { command }, { timeoutMs });
+      const result = mutating
+        ? await runRemoteJob(command)
+        : await execute("run_command", { command }, { timeoutMs });
+
+      if (result?.ok === false) {
+        return result;
+      }
 
       // Keep tool output small - it is fed back into the next prompt and then
       // spoken aloud.

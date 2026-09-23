@@ -12,6 +12,11 @@ const EXECUTOR_URL =
 export const INLINE_TIMEOUT_MS = Number(process.env.EXECUTOR_TIMEOUT_MS || 4000);
 export const BACKGROUND_TIMEOUT_MS = Number(process.env.EXECUTOR_BG_TIMEOUT_MS || 120000);
 
+// How long a confirmed command may take on the PC before it is given up on.
+// A Claude CLI run is minutes, not seconds, so this is far longer than either
+// of the above - it bounds a poll loop, not a single open request.
+export const REMOTE_JOB_TIMEOUT_MS = Number(process.env.EXECUTOR_JOB_TIMEOUT_MS || 900000);
+
 // The automation URL is public. Set EXECUTOR_SECRET on both ends and have the
 // PC agent reject requests that arrive without it.
 const EXECUTOR_SECRET = process.env.EXECUTOR_SECRET;

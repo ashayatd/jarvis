@@ -18,6 +18,7 @@ import {
 import { BACKGROUND_TIMEOUT_MS } from "../services/executorService.js";
 import { generateAIReply } from "../services/groqService.js";
 import {
+  confirmationFor,
   describeToolCall,
   isBackgroundable,
   parseToolArgs,
@@ -66,8 +67,13 @@ const EXIT_PHRASES = new Set([
   "quit",
 ]);
 
-// Punctuation and case removed so "Thank you!" matches. Used for both exact
-// match lists.
+// Exact match again, and deliberately short: a confirmation has to be an
+// unambiguous yes and nothing else, because the next thing that happens is a
+// command running on the user's PC.
+const CONFIRMATIONS = new Set(["yes", "yeah", "yep", "do it", "confirm"]);
+
+// Punctuation and case removed so "Thank you!" matches. Used for every exact
+// match list.
 const normalizePhrase = (text) =>
   text
     .toLowerCase()
@@ -97,14 +103,17 @@ const sweepSessions = () => {
   }
 };
 
-const getSessionMemory = (req) => {
+// Returns the whole entry, not just the memory: a command held at the
+// confirmation gate has to survive from the turn that proposed it to the turn
+// that answers yes, and the session is the only thing that spans both.
+const getSession = (req) => {
   sweepSessions();
 
   const key = sessionKeyFor(req);
   let entry = sessions.get(key);
 
   if (!entry) {
-    entry = { memory: createChatMemory(), lastSeen: Date.now() };
+    entry = { memory: createChatMemory(), lastSeen: Date.now(), pendingAction: null };
     sessions.set(key, entry);
     log(`[SESS] new session=${key} (${sessions.size} active)`);
   } else {
@@ -113,7 +122,7 @@ const getSessionMemory = (req) => {
 
   entry.lastSeen = Date.now();
 
-  return entry.memory;
+  return entry;
 };
 
 // Alexa speaks this string literally, so markdown has to go even though the
@@ -175,19 +184,23 @@ const extractUserQuery = (req) => {
 // Races the tool against the deadline. If the deadline wins, the SAME promise
 // keeps running and is handed to the job registry - nothing is cancelled or
 // restarted, so the work is never done twice.
-const runToolOrBackground = async (toolCall, sessionKey) => {
+const runToolOrBackground = async (toolCall, sessionKey, { confirmed = false } = {}) => {
   const name = toolCall.function?.name;
   const args = parseToolArgs(toolCall) ?? {};
 
   // Reading job state must stay instant, or "is it done?" would itself queue.
   if (!isBackgroundable(name)) {
-    return { mode: "inline", result: await runTool(toolCall, { sessionKey }) };
+    return { mode: "inline", result: await runTool(toolCall, { sessionKey, confirmed }) };
   }
 
   // Started with the long timeout up front: if this becomes a job it must
   // outlive the deadline, and an abort signal cannot be extended later.
   const startedAt = Date.now();
-  const promise = runTool(toolCall, { sessionKey, timeoutMs: BACKGROUND_TIMEOUT_MS });
+  const promise = runTool(toolCall, {
+    sessionKey,
+    confirmed,
+    timeoutMs: BACKGROUND_TIMEOUT_MS,
+  });
 
   let timer;
   const deadline = new Promise((resolve) => {
@@ -230,8 +243,37 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
     addAssistantMessage(chatMemory, message);
 
     let backgrounded = false;
+    let gated = null;
 
     for (const toolCall of message.tool_calls) {
+      // Every tool call in this message still needs a result appended, gated
+      // or not - the API rejects an assistant turn whose tool_calls are left
+      // unanswered.
+      if (gated) {
+        addToolResult(chatMemory, toolCall.id, {
+          ok: false,
+          error: "Not run - an earlier step is waiting on the user's confirmation.",
+        });
+
+        continue;
+      }
+
+      const confirmation = confirmationFor(toolCall);
+
+      // Held, not executed. Nothing after it runs either: the user may still
+      // say no, and what follows was planned assuming this one succeeded.
+      if (confirmation) {
+        gated = confirmation;
+
+        addToolResult(chatMemory, toolCall.id, {
+          ok: false,
+          status: "awaiting_confirmation",
+          note: `Not executed. The user is being asked to confirm "${confirmation.command}" out loud.`,
+        });
+
+        continue;
+      }
+
       const outcome = await runToolOrBackground(toolCall, sessionKey);
 
       if (outcome.mode === "background") {
@@ -246,6 +288,19 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
       } else {
         addToolResult(chatMemory, toolCall.id, outcome.result);
       }
+    }
+
+    // Asking takes priority over anything else this round: the gate is the
+    // whole point, and the reply names the command so the user knows what
+    // they are agreeing to.
+    if (gated) {
+      logWarn(`[GATE] holding "${gated.command}" for confirmation`);
+
+      return {
+        role: "assistant",
+        content: `That will run ${gated.command}. Say yes to confirm.`,
+        pendingAction: gated,
+      };
     }
 
     // Something went to the background. Answering now costs one fewer LLM
@@ -277,6 +332,30 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
 
   return message;
 };
+
+// A confirmed command answers without a second LLM call. The deadline has
+// usually eaten most of Alexa's budget by this point, and there is nothing to
+// decide - the command either ran or it did not.
+const describeOutcome = (command, outcome) => {
+  if (outcome.mode === "background") {
+    return "That's running now. Ask me for a status update in a bit.";
+  }
+
+  if (outcome.result?.ok === false) {
+    return `That didn't work. ${outcome.result.error ?? ""}`.trim();
+  }
+
+  const output = outcome.result?.output;
+
+  return output ? `Done. ${output}` : `Done. ${command} finished.`;
+};
+
+const outcomeForModel = (outcome) =>
+  JSON.stringify(
+    outcome.mode === "background"
+      ? { status: "running", job_id: outcome.job.id }
+      : outcome.result,
+  ).slice(0, 600);
 
 // Finished work the user was never told about, injected so Jarvis can mention
 // it unprompted instead of waiting to be asked.
@@ -353,7 +432,48 @@ router.post("/alexa", async (req, res) => {
       return res.json(buildAlexaResponse("Exiting AI mode. Goodbye!", true));
     }
 
-    const chatMemory = getSessionMemory(req);
+    const session = getSession(req);
+    const chatMemory = session.memory;
+
+    // A pending command is answered on the very next turn or not at all, and
+    // it is consumed either way: anything other than a plain yes drops it and
+    // is then handled as an ordinary turn.
+    if (session.pendingAction) {
+      const pending = session.pendingAction;
+      session.pendingAction = null;
+
+      if (CONFIRMATIONS.has(normalized)) {
+        log(`[GATE] confirmed "${pending.command}" session=${sessionKey}`);
+        addUserMessage(chatMemory, userQuery);
+
+        const outcome = await runToolOrBackground(pending.toolCall, sessionKey, {
+          confirmed: true,
+        });
+
+        const spoken = describeOutcome(pending.command, outcome);
+
+        // Recorded as a note rather than a tool result: the assistant turn
+        // that asked for this command was answered last turn, so there is no
+        // open tool call left for a result to attach to.
+        addSystemNote(
+          chatMemory,
+          `The user confirmed "${pending.command}" and it was run. Outcome: ${outcomeForModel(outcome)}`,
+        );
+        addAssistantMessage(chatMemory, spoken);
+        trimHistory(chatMemory, 20);
+
+        log(`[TURN] complete in ${turnTimer()}ms (confirmed action)`, `jobs=${jobCount()}`);
+
+        return res.json(buildAlexaResponse(spoken, false));
+      }
+
+      logWarn(`[GATE] not confirmed - dropping "${pending.command}" session=${sessionKey}`);
+      addSystemNote(
+        chatMemory,
+        `The user did not confirm "${pending.command}", so it was not run. Do not run it unless they ask again.`,
+      );
+    }
+
     const lower = userQuery.toLowerCase();
 
     if (
@@ -372,6 +492,10 @@ router.post("/alexa", async (req, res) => {
     injectFinishedJobs(chatMemory, sessionKey);
 
     const message = await runConversationTurn(chatMemory, sessionKey);
+
+    if (message.pendingAction) {
+      session.pendingAction = message.pendingAction;
+    }
 
     addAssistantMessage(chatMemory, message);
     trimHistory(chatMemory, 20);
