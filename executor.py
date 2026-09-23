@@ -4,16 +4,34 @@ import subprocess
 import threading
 import time
 import uuid
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The Node side reads this same .env, and until now this process did not, so
+# any setting put there was silently ignored here - EXECUTOR_SECRET included,
+# which only worked because it happened to match the default below. Existing
+# environment variables still win, so the tests can override.
+load_dotenv(os.path.join(HERE, ".env"))
 
 app = Flask(__name__)
 
 SECRET = os.environ.get("EXECUTOR_SECRET", "jarvis_secret_123")
 
-# Where a confirmed command runs. The Claude CLI acts on whatever directory it
-# is started in, so this is the one setting that decides which project it
-# edits. Unset means this file's own directory.
-WORKDIR = os.environ.get("EXECUTOR_WORKDIR") or os.path.dirname(os.path.abspath(__file__))
+# Where every command runs, and the one setting that decides which project the
+# Claude CLI edits: it acts on the directory it was started in. This is the
+# workspace, deliberately not this repo - run_claude builds the user's
+# projects, it does not edit Jarvis itself.
+DEFAULT_WORKDIR = os.path.normpath("C:/projects/alexaProjects")
+WORKDIR = os.environ.get("EXECUTOR_WORKDIR") or DEFAULT_WORKDIR
+
+# Created at import rather than in __main__, so it exists however this module
+# is started. Without it every job would fail on cwd before it ran anything.
+try:
+    os.makedirs(WORKDIR, exist_ok=True)
+except OSError as error:
+    print(f"[EXEC] WARNING: could not create workdir {WORKDIR}: {error}")
 
 # A `claude -p "..."` run is minutes, not seconds. Nothing that long may hold a
 # Flask worker, so it runs in a thread and the caller polls job_status.
@@ -165,8 +183,10 @@ def execute():
     command = data.get("command")
 
     if command == "open_vscode":
-        subprocess.run("code .", shell=True)
-        return jsonify({"ok": True, "output": "VS Code launched successfully."})
+        # The path is passed explicitly rather than relying on ".", so the
+        # window lands on the workspace no matter where this was started from.
+        subprocess.run(f'code "{WORKDIR}"', shell=True, cwd=WORKDIR)
+        return jsonify({"ok": True, "output": f"VS Code launched on {WORKDIR}."})
 
     if command == "run_command":
         shell_command = data.get("args", {}).get("command", "")

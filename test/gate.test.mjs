@@ -27,6 +27,11 @@ process.env.EXECUTOR_SECRET = SECRET;
 // prompt arrived unmangled.
 process.env.EXECUTOR_CLAUDE_BIN = process.execPath;
 
+// Overrides the real workspace: the suite should not touch it, and the
+// read-only git test wants a directory that is actually a repo. Set here
+// because executor.py reads .env, where this is also configured.
+process.env.EXECUTOR_WORKDIR = root;
+
 // One scripted assistant reply is consumed per generateAIReply call.
 const scripted = [];
 
