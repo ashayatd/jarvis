@@ -1,3 +1,4 @@
+import { AUTONOMOUS_SUFFIX } from "../data/chatMemory.js";
 import { describeJob, getSessionJobs } from "../data/jobRegistry.js";
 import {
   execute,
@@ -93,6 +94,19 @@ export const confirmationFor = (toolCall) => {
     return null;
   }
 };
+
+// The system prompt tells the model to append this itself. This is the
+// backstop: a forgotten suffix would mean the CLI answers with code as text
+// instead of writing files, which is too easy a way for the whole feature to
+// go quiet. Idempotent, so doing it in both places appends it once.
+const withAutonomy = (prompt) =>
+  prompt.includes(AUTONOMOUS_SUFFIX) ? prompt : `${prompt}
+
+${AUTONOMOUS_SUFFIX}`;
+
+// ...and the inverse, for anything the user hears. Reading the suffix aloud
+// would make every confirmation a paragraph long.
+const withoutAutonomy = (prompt) => prompt.replace(AUTONOMOUS_SUFFIX, "").trim();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -272,9 +286,11 @@ const TOOLS = {
   run_claude: {
     backgroundable: true,
     describe: (args) => `ask Claude to ${args.prompt ?? "do something"}`,
-    // Every Claude run edits files, so the prompt is always read back first.
+    // Every Claude run edits files, so the prompt is always read back first -
+    // minus the appended instruction, which the user did not ask for and does
+    // not need to hear.
     confirm: ({ prompt }) => {
-      const wanted = typeof prompt === "string" ? prompt.trim() : "";
+      const wanted = typeof prompt === "string" ? withoutAutonomy(prompt) : "";
 
       return wanted ? { command: `Claude with: ${wanted}` } : null;
     },
@@ -283,7 +299,7 @@ const TOOLS = {
       function: {
         name: "run_claude",
         description:
-          "Hand a coding or file-editing task to the Claude CLI on the user's PC. Use this for anything that writes, edits, refactors, explains or reviews code - it is the only tool that can change files. Pass the user's request as the prompt, in full and in plain English. The user is asked to confirm out loud before it runs, and the work takes minutes, so it usually finishes in the background.",
+          "Hand a coding or file-editing task to the Claude CLI on the user's PC. Use this for anything that writes, edits, refactors, explains or reviews code - it is the only tool that can change files. Pass the user's request as the prompt, in full and in plain English, and append the instruction the system prompt gives you for this tool. The user is asked to confirm out loud before it runs, and the work takes minutes, so it usually finishes in the background.",
         parameters: {
           type: "object",
           properties: {
@@ -313,7 +329,11 @@ const TOOLS = {
         return { ok: false, error: "The user has not confirmed this yet." };
       }
 
-      const result = await runRemoteJob("start_claude", { prompt: instruction }, instruction);
+      const result = await runRemoteJob(
+        "start_claude",
+        { prompt: withAutonomy(instruction) },
+        instruction,
+      );
 
       if (result?.ok === false) {
         return result;

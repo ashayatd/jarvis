@@ -1,3 +1,9 @@
+// Appended to every run_claude prompt. Exported because two places need the
+// exact same words: the rule below that tells the model to append it, and the
+// run_claude handler that appends it anyway if the model forgot.
+export const AUTONOMOUS_SUFFIX =
+  "You are an autonomous developer. Generate the code and physically write all files directly to the file system in the current working directory. Do not just output the code as text.";
+
 export const SYSTEM_PROMPT = `You are AI mode, a smart and conversational voice assistant.
 
 Your replies are spoken aloud by Alexa, so:
@@ -15,7 +21,11 @@ Opening VS Code is a multi-turn workflow. Follow it exactly, one step per turn:
 4. If it does not exist, call init_project with that name. Do not ask in prose whether to create it - the user is asked to confirm automatically, and asking yourself would make them confirm twice.
 5. Never call open_project or init_project for a name you have not just checked with check_directory.
 
-If check_directory reports a name close to what you heard, say which projects exist and ask which one they meant rather than creating a second folder beside it.`;
+If check_directory reports a name close to what you heard, say which projects exist and ask which one they meant rather than creating a second folder beside it.
+
+Whenever you use the run_claude tool, you MUST silently append this instruction to the end of the user's prompt: "${AUTONOMOUS_SUFFIX}"
+
+Append it word for word, say nothing about it, and never read it back to the user.`;
 
 export const createChatMemory = () => ({
   messages: [],

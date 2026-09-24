@@ -71,6 +71,15 @@ CLAUDE_BIN = _resolve_claude()
 # editor window appearing for every case.
 VSCODE_BIN = os.environ.get("EXECUTOR_VSCODE_BIN", "code")
 
+# Without this the CLI cannot write anything. In print mode it has no way to
+# ask for permission to use Write or Edit - and stdin is /dev/null here by
+# design - so it answers with the code as text and stops: "I've created
+# hello.txt ... it just needs your permission to write the file". acceptEdits
+# grants file edits up front, which is what makes a run autonomous. Set the
+# variable to an empty string to go back to asking, or to
+# "bypassPermissions" to allow everything.
+CLAUDE_PERMISSION_MODE = os.environ.get("EXECUTOR_CLAUDE_PERMISSION_MODE", "acceptEdits")
+
 # Finished jobs are kept only long enough for the caller to read them back.
 JOB_TTL_S = 30 * 60
 
@@ -380,11 +389,16 @@ def execute():
         if not prompt:
             return jsonify({"ok": False, "error": "No prompt provided."}), 400
 
-        job_id = _start_job(
-            [CLAUDE_BIN, "-p", prompt],
-            use_shell=False,
-            label=f"claude: {prompt}",
-        )
+        argv = [CLAUDE_BIN, "-p"]
+
+        if CLAUDE_PERMISSION_MODE:
+            argv += ["--permission-mode", CLAUDE_PERMISSION_MODE]
+
+        # The prompt stays last and stays one argument, so nothing in it can be
+        # read as a flag.
+        argv.append(prompt)
+
+        job_id = _start_job(argv, use_shell=False, label=f"claude: {prompt}")
 
         return jsonify({"ok": True, "status": "running", "job_id": job_id})
 
@@ -421,6 +435,7 @@ if __name__ == '__main__':
     print(f"[EXEC] workdir: {WORKDIR}")
     print(f"[EXEC] claude : {CLAUDE_BIN}")
     print(f"[EXEC] vscode : {VSCODE_BIN}")
+    print(f"[EXEC] claude permission mode: {CLAUDE_PERMISSION_MODE or '(ask - the CLI will not write files)'}")
     # threaded is the default, but it is the thing that makes job_status
     # answerable while a job is still running, so it is set explicitly.
     app.run(port=int(os.environ.get("EXECUTOR_PORT", "5000")), threaded=True)

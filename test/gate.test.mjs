@@ -89,6 +89,9 @@ before(async () => {
       ...process.env,
       EXECUTOR_PORT: String(EXECUTOR_PORT),
       EXECUTOR_SECRET: SECRET,
+      // The node stand-in reads its script from the first argument, so it
+      // cannot also be passed --permission-mode. Empty disables the flag.
+      EXECUTOR_CLAUDE_PERMISSION_MODE: "",
     },
     stdio: "ignore",
   });
@@ -240,15 +243,39 @@ test("a confirmed Claude run is released to the CLI", async () => {
   assert.match(r.text, /Done\.|didn't work|running now/);
 });
 
-test("shell metacharacters survive in a Claude prompt", async () => {
-  // Evaluated by the node stand-in: a shell would have mangled $x and (y),
-  // so getting the length of the literal string back proves argv was used.
-  scripted.push(toolCall("run_claude", { prompt: '"a$x(y)".length' }));
-  const gated = await say("c2", "count that string");
-  assert.match(gated.text, /Say yes to confirm/);
+test("shell metacharacters survive the trip to the CLI", async () => {
+  // Straight at the executor, because the tool handler appends the autonomy
+  // instruction and node -p would then have invalid input to evaluate. What
+  // is under test here is executor.py: the prompt becomes one argv entry with
+  // no shell involved, so $x and (y) arrive as themselves. A shell would have
+  // eaten both, and the length would not come back as 6.
+  const start = await fetch(process.env.EXECUTOR_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Executor-Secret": SECRET },
+    body: JSON.stringify({ command: "start_claude", args: { prompt: '"a$x(y)".length' } }),
+  });
 
-  const r = await say("c2", "yes");
-  assert.match(r.text, /Done\. 6/);
+  const { job_id: jobId } = await start.json();
+
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const res = await fetch(process.env.EXECUTOR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Executor-Secret": SECRET },
+      body: JSON.stringify({ command: "job_status", args: { job_id: jobId } }),
+    });
+
+    const status = await res.json();
+
+    if (status.status !== "running") {
+      assert.equal(status.status, "done");
+      assert.match(status.output, /^6/);
+      return;
+    }
+  }
+
+  throw new Error("stand-in CLI never finished");
 });
 
 test("an unconfirmed Claude run is refused by the handler too", async () => {
@@ -449,4 +476,25 @@ test("a carrier phrase on a real question is still passed to the model", async (
 
   assert.equal(r.end, false);
   assert.equal(r.text, "It is Tuesday.");
+});
+
+// --- the autonomy instruction --------------------------------------------
+
+test("the appended instruction is never read back to the user", async () => {
+  const { AUTONOMOUS_SUFFIX } = await import("../src/data/chatMemory.js");
+
+  scripted.push(toolCall("run_claude", { prompt: `build a landing page
+
+${AUTONOMOUS_SUFFIX}` }));
+  const r = await say("a1", "build me a landing page");
+
+  assert.equal(r.text, "That will run Claude with: build a landing page. Say yes to confirm.");
+  assert.doesNotMatch(r.text, /autonomous developer/);
+});
+
+test("the system prompt carries the rule and the exact wording", async () => {
+  const { SYSTEM_PROMPT, AUTONOMOUS_SUFFIX } = await import("../src/data/chatMemory.js");
+
+  assert.match(SYSTEM_PROMPT, /run_claude/);
+  assert.ok(SYSTEM_PROMPT.includes(AUTONOMOUS_SUFFIX));
 });
