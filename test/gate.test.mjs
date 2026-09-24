@@ -107,7 +107,16 @@ before(async () => {
 after(() => {
   server?.close();
   executor?.kill();
-  fs.rmSync(workspace, { recursive: true, force: true });
+
+  // Best effort. A job the suite started may still be holding the workspace as
+  // its working directory, and Windows refuses to remove a directory while any
+  // process is sitting in it. It is under the temp directory, so leaving it is
+  // harmless - failing the run over tidying up would not be.
+  try {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  } catch (error) {
+    console.log(`[test] left ${workspace} behind: ${error.code}`);
+  }
 });
 
 const say = async (sessionId, text) => {

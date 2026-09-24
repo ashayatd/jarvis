@@ -22,6 +22,18 @@ const cases = [
   ["git log --oneline", false],
   ["git diff --stat", false],
 
+  // Running a project. A URL has a colon in it but no drive letter before it,
+  // which is the case the absolute-path rule has to get right.
+  ["npm start", false],
+  ["npm run dev", false],
+  ["node server.js", false],
+  ["node src/index.js", false],
+  ["python app.py", false],
+  ["python -m http.server 8000", false],
+  ["npx serve", false],
+  ["start http://localhost:3000", false],
+  ["start https://localhost:5173/", false],
+
   // Absolute drive paths, in both slash directions and either case.
   ["type C:\\Users\\me\\.env", true],
   ["type C:/Users/me/.env", true],

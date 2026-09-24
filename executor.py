@@ -150,6 +150,23 @@ def _escapes_workspace(command):
     return bool(_ABSOLUTE_PATH.search(command) or _TRAVERSAL.search(command))
 
 
+# Secrets this process needs and its children have no business seeing. Loading
+# .env put these on os.environ, and a child inherits it, so without this
+# "node -p process.env.GROQ_API_KEY" reads the key straight out - a command
+# with no metacharacters, no absolute path and no "..", so nothing else stops
+# it. ANTHROPIC_API_KEY is deliberately not here: the Claude CLI needs it.
+_PRIVATE_ENV = ("GROQ_API_KEY", "EXECUTOR_SECRET")
+
+
+def _child_env():
+    env = os.environ.copy()
+
+    for name in _PRIVATE_ENV:
+        env.pop(name, None)
+
+    return env
+
+
 def _resolve_within_workspace(relative):
     """Absolute path for a workspace-relative directory, or None if it escapes.
 
@@ -220,6 +237,7 @@ def _run_job(job_id, command, use_shell, label, cwd=None):
             text=True,
             timeout=JOB_TIMEOUT_S,
             cwd=cwd or WORKDIR,
+            env=_child_env(),
             # Without this an interactive prompt (the Claude CLI asking to
             # trust a folder, say) waits on a stdin that nobody will ever
             # write to, and the job hangs until the timeout instead of
@@ -305,6 +323,14 @@ def execute():
                 "error": f"'{shell_command}' names a path outside the workspace.",
             }), 400
 
+        run_cwd = _resolve_within_workspace(data.get("args", {}).get("cwd", ""))
+
+        if run_cwd is None or not os.path.isdir(run_cwd):
+            return jsonify({
+                "ok": False,
+                "error": f"'{data.get('args', {}).get('cwd')}' is not a project in the workspace.",
+            }), 400
+
         # shell=True runs whatever arrives here. Three things keep that safe:
         # the Node side allowlists commands before they are sent, Flask binds
         # 127.0.0.1 so nothing off this machine can reach it, and the check
@@ -321,7 +347,8 @@ def execute():
                 capture_output=True,
                 text=True,
                 timeout=15,
-                cwd=WORKDIR,
+                cwd=run_cwd,
+                env=_child_env(),
                 stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
@@ -349,9 +376,23 @@ def execute():
                 "error": f"'{shell_command}' names a path outside the workspace.",
             }), 400
 
-        return jsonify(
-            {"ok": True, "status": "running", "job_id": _start_job(shell_command, use_shell=True)}
-        )
+        job_cwd = _resolve_within_workspace(data.get("args", {}).get("cwd", ""))
+
+        if job_cwd is None or not os.path.isdir(job_cwd):
+            return jsonify({
+                "ok": False,
+                "error": f"'{data.get('args', {}).get('cwd')}' is not a project in the workspace.",
+            }), 400
+
+        where = os.path.relpath(job_cwd, os.path.abspath(WORKDIR))
+        label = shell_command if where == "." else f"{shell_command} (in {where})"
+
+        return jsonify({
+            "ok": True,
+            "status": "running",
+            "cwd": job_cwd,
+            "job_id": _start_job(shell_command, use_shell=True, label=label, cwd=job_cwd),
+        })
 
     # Deliberately instant and read-only: this is what lets the assistant ask
     # "which project?" and act on the answer inside one spoken turn.

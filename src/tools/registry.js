@@ -24,29 +24,63 @@ const APP_COMMANDS = {
   "spotify": "open_spotify",
 };
 
-// Deliberately narrow. This endpoint is reachable from the public internet,
-// so anything added here is runnable by anyone who finds the tunnel URL.
-// Read-only commands only until the executor requires EXECUTOR_SECRET.
-const ALLOWED_COMMANDS = [
+// Commands that may run with no confirmation. Matched on a prefix with a space
+// boundary, so an entry permits its own arguments - "npm run" covers "npm run
+// build" - but never a longer word: "node" does not match "nodemon". An entry
+// is therefore a promise about everything that can follow it.
+//
+// Wide enough to start a project of any shape, which is the point, and that
+// makes this the main thing standing between the tunnel and arbitrary code
+// execution. Two rules keep it honest, both enforced on every command below:
+// no shell metacharacters, and nothing outside the workspace. "npx" is the
+// loosest entry by far - it fetches and runs code from the registry, which no
+// local rule can vet. Moving it to MUTATING_PREFIXES is the one-line change if
+// that trade stops being worth it.
+const ALLOWED_PREFIXES = [
+  // Reading the repo.
   "git status",
   "git log",
   "git branch",
   "git diff",
   "git remote",
+  // Reading the workspace. Relative paths only - an absolute one is rejected
+  // before this is reached, so this cannot read outside the workspace.
   "dir",
   "ls",
-  // Reads a file. Relative paths resolve inside the workspace because that is
-  // the executor's cwd - but an absolute one does not, so this can read any
-  // file the executor's user can. See the note above about what reaching this
-  // endpoint means.
-  // Relative paths only - an absolute one is rejected before this is reached,
-  // so it cannot read outside the workspace.
   "type",
+  // Asking the machine about itself.
   "whoami",
   "date",
   "node -v",
   "npm -v",
+  // Running a project, whatever it happens to be built with.
+  "npm start",
+  "npm run",
+  "node",
+  "python",
+  "npx",
 ];
+
+// Opening the result in the browser. Not in the list above because the space
+// boundary there does not fit: "start http://localhost:3000" has no space
+// after "http", so a prefix entry would never match it. A pattern is a better
+// fit anyway - it pins the argument to a single http or https URL, so this
+// cannot become "start notepad.exe" or "start ." and launch something.
+const BROWSER_URL = /^start https?:\/\/\S*$/;
+
+// These do not finish on their own - a dev server runs until something stops
+// it. Sent as background jobs rather than inline, because inline means the
+// executor's 15 second ceiling, which would kill a server just as it finished
+// booting and then report it as a timeout.
+const LONG_RUNNING_PREFIXES = ["npm start", "npm run", "node", "python", "npx"];
+
+const matchesPrefix = (command, prefixes) => {
+  const normalized = command.trim().toLowerCase();
+
+  return prefixes.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix} `),
+  );
+};
 
 // Commands that change something: the repo, the installed packages, or files
 // on disk by way of the Claude CLI. These are never run on the model's word
@@ -89,13 +123,14 @@ const isMutating = (command) => {
   return MUTATING_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 };
 
-const isAllowed = (command) => {
-  const normalized = command.trim().toLowerCase();
+// Both exported for the same reason as escapesWorkspace: a prefix list is a
+// set of promises about what may follow each entry, and that is worth asserting
+// directly rather than only through whatever a tool does with the answer.
+export const isAllowed = (command) =>
+  matchesPrefix(command, ALLOWED_PREFIXES) ||
+  BROWSER_URL.test(command.trim().toLowerCase());
 
-  return ALLOWED_COMMANDS.some(
-    (allowed) => normalized === allowed || normalized.startsWith(`${allowed} `),
-  );
-};
+export const isLongRunning = (command) => matchesPrefix(command, LONG_RUNNING_PREFIXES);
 
 // What has to be confirmed before this tool call may run, or null if it can
 // go straight through. The policy lives on each tool as `confirm`, so a tool
@@ -248,13 +283,21 @@ const TOOLS = {
       function: {
         name: "run_command",
         description:
-          `Run a command on the user's PC and return its output. These run straight away: ${ALLOWED_COMMANDS.join(", ")}. Commands starting with ${MUTATING_PREFIXES.map((prefix) => prefix.trim()).join(", ")} are allowed too, but the user is asked to confirm them out loud first - call the tool as normal and the confirmation is handled for you. Do not use this for coding or file edits - that is what run_claude is for. Nothing else is permitted, and commands may not be chained.`,
+          `Run a command on the user's PC and return its output. Anything starting with one of these runs straight away: ${ALLOWED_PREFIXES.join(", ")}, and "start <url>" to open a page in the browser. Use them to start a project however it is built - "npm start" or "npm run dev" for node, "python app.py" for python - and "start http://localhost:3000" to open it in the browser. Pass cwd so it runs in the project rather than the workspace root. A server keeps running in the background, so say it has started rather than waiting for it to finish. Commands starting with ${MUTATING_PREFIXES.map((prefix) => prefix.trim()).join(", ")} are allowed too, but the user is asked to confirm those out loud first - call the tool as normal and the confirmation is handled for you. Do not use this for coding or file edits - that is what run_claude is for. Nothing else is permitted, commands may not be chained, and every path must be relative to the workspace.`,
         parameters: {
           type: "object",
           properties: {
             command: {
               type: "string",
-              description: "The command line to run, e.g. 'git status'.",
+              description: "The command line to run, e.g. 'git status' or 'npm start'.",
+            },
+            cwd: {
+              // Must accept null: the model sends cwd=null when omitting it,
+              // and Groq validates tool arguments server-side and 400s on a
+              // bare "string".
+              type: ["string", "null"],
+              description:
+                "Optional project folder to run in, e.g. 'landing page'. Pass this whenever the command belongs to a project - 'npm start' in the workspace root will not find the project's package.json. Omit or pass null for a command about the machine itself.",
             },
           },
           required: ["command"],
@@ -264,10 +307,12 @@ const TOOLS = {
     // `confirmed` is set only by the route handler, and only once the user has
     // said yes to this exact command. It is the only way a mutating command
     // reaches the executor.
-    handler: async ({ command }, { timeoutMs, confirmed = false }) => {
+    handler: async ({ command, cwd }, { timeoutMs, confirmed = false }) => {
       if (!command) {
         return { ok: false, error: "No command given." };
       }
+
+      const folder = typeof cwd === "string" ? cwd.trim() : "";
 
       if (hasShellMetacharacters(command)) {
         logError(`[TOOL] BLOCKED, shell metacharacters: ${preview(command, 120)}`);
@@ -298,13 +343,22 @@ const TOOLS = {
 
         return {
           ok: false,
-          error: `"${command}" is not on the allowed list. Permitted: ${ALLOWED_COMMANDS.join(", ")}.`,
+          error: `"${command}" is not on the allowed list. Permitted: ${ALLOWED_PREFIXES.join(", ")}.`,
         };
       }
 
-      const result = readOnly
-        ? await execute("run_command", { command }, { timeoutMs })
-        : await runRemoteJob("start_command", { command }, command);
+      const args = { command, ...(folder ? { cwd: folder } : {}) };
+      const label = folder ? `${command} (in ${folder})` : command;
+
+      // Inline only when it will actually finish. A dev server would hit the
+      // executor's 15 second ceiling and be killed, so anything long-running
+      // goes down the job path even though it needed no confirmation - the
+      // spoken reply then says it started rather than waiting for an end that
+      // is not coming.
+      const result =
+        readOnly && !isLongRunning(command)
+          ? await execute("run_command", args, { timeoutMs })
+          : await runRemoteJob("start_command", args, label);
 
       if (result?.ok === false) {
         return result;
@@ -317,7 +371,7 @@ const TOOLS = {
           ? result.output.slice(0, 800)
           : JSON.stringify(result).slice(0, 800);
 
-      return { ok: true, command, output };
+      return { ok: true, command, ...(folder ? { cwd: folder } : {}), output };
     },
   },
 
