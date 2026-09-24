@@ -577,3 +577,83 @@ test("a cwd cannot escape the workspace", async () => {
   assert.equal(body.ok, false);
   assert.match(body.error, /workspace/);
 });
+
+// --- confinement, through the whole path ---------------------------------
+
+test("an absolute path is refused, not read", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "run_command", arguments: JSON.stringify({ command: "type C:/projects/jarvis/jarvis/.env" }) } },
+    {},
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /outside the project workspace/);
+  // The point of the rule: no part of the file comes back.
+  assert.ok(!("output" in result));
+});
+
+test("a traversal out of the workspace is refused", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "run_command", arguments: JSON.stringify({ command: "type ../../.env" }) } },
+    {},
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /outside the project workspace/);
+});
+
+test("an escaping command is refused outright, never offered for confirmation", async () => {
+  scripted.push(toolCall("run_command", { command: "git add C:/projects/jarvis/jarvis/.env" }));
+  scripted.push({ role: "assistant", content: "I can't reach that." });
+  const r = await say("cf1", "stage that file");
+
+  assert.equal(r.text, "I can't reach that.");
+  assert.doesNotMatch(r.text, /Say yes/);
+});
+
+test("the executor refuses it too, with no Node allowlist in the path", async () => {
+  const { body, status } = await executorPost("run_command", {
+    command: "type C:/projects/jarvis/jarvis/.env",
+  });
+
+  assert.equal(status, 400);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /outside the workspace/);
+});
+
+test("relative work inside the workspace is untouched by all of this", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "run_command", arguments: JSON.stringify({ command: "type notes.txt" }) } },
+    {},
+  );
+
+  assert.equal(result.ok, true);
+  assert.match(result.output, /hello from the workspace/);
+});
+
+// --- exiting -------------------------------------------------------------
+
+test("exit pluto ends the session", async () => {
+  const r = await sayIntent("x1", "AskIntent", { query: { name: "query", value: "exit pluto" } });
+
+  assert.equal(r.end, true);
+});
+
+test("the invocation name works as a carrier, which the fallback advice relies on", async () => {
+  // The escalation line tells the user to say "Pluto, followed by your
+  // command", so "Pluto, stop" has to reach the exit list.
+  const r = await sayIntent("x2", "AskIntent", { query: { name: "query", value: "Pluto, stop" } });
+
+  assert.equal(r.end, true);
+});
+
+test("pluto in front of a real question still reaches the model", async () => {
+  scripted.push({ role: "assistant", content: "It is Wednesday." });
+  const r = await sayIntent("x3", "AskIntent", { query: { name: "query", value: "pluto what day is it" } });
+
+  assert.equal(r.end, false);
+  assert.equal(r.text, "It is Wednesday.");
+});

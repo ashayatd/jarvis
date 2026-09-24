@@ -64,6 +64,7 @@ const EXIT_PHRASES = new Set([
   "stop",
   "goodbye",
   "exit ai mode",
+  "exit pluto",
   "quit",
 ]);
 
@@ -86,7 +87,7 @@ const CONFIRMATIONS = new Set(["yes", "yeah", "yep", "do it", "confirm"]);
 // the slot, carrier phrase and all, so "tell me stop" arrives where "stop"
 // used to. Stripped only for the exact-match lists below - the model still
 // receives what the user actually said.
-const CARRIER_PHRASES = /^(?:ai mode|jarvis|alexa|computer|tell me|ask|say)\s+/;
+const CARRIER_PHRASES = /^(?:pluto|ai mode|jarvis|alexa|computer|tell me|ask|say)\s+/;
 
 // Punctuation and case removed so "Thank you!" matches. Used for every exact
 // match list.

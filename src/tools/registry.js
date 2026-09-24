@@ -39,6 +39,8 @@ const ALLOWED_COMMANDS = [
   // the executor's cwd - but an absolute one does not, so this can read any
   // file the executor's user can. See the note above about what reaching this
   // endpoint means.
+  // Relative paths only - an absolute one is rejected before this is reached,
+  // so it cannot read outside the workspace.
   "type",
   "whoami",
   "date",
@@ -58,6 +60,26 @@ export const MUTATING_PREFIXES = ["git ", "npm ", "npx ", "claude "];
 const SHELL_METACHARACTERS = /[;&|<>`$()\x00-\x1f]/;
 
 const hasShellMetacharacters = (command) => SHELL_METACHARACTERS.test(command);
+
+// Confinement, not sandboxing. The executor already runs every command with
+// the workspace as its cwd, so a relative path cannot leave it - these reject
+// the ways a command can name somewhere else outright. It matters because this
+// service is reachable through the tunnel and "type" reads files: without it,
+// "type C:\Users\me\projects\jarvis\.env" hands over the Groq key.
+//
+// A token starting with a drive letter and colon ("C:\", "C:/", "C:foo") or
+// with a backslash ("\Windows", "\\server\share") is an absolute path.
+const ABSOLUTE_PATH = /(?:^|[\s"'(=])(?:[A-Za-z]:|\\)/;
+
+// Anywhere, not only at a token start: "notes/../../secrets" climbs out from
+// the middle. The casualty is a git revision range like "main..HEAD", which is
+// a fair trade for a rule with no gaps in it.
+const TRAVERSAL = /\.\./;
+
+// Exported so the rule itself can be tested against a table of commands,
+// rather than only through whatever a tool happens to do with it.
+export const escapesWorkspace = (command) =>
+  ABSOLUTE_PATH.test(command) || TRAVERSAL.test(command);
 
 // The trailing space makes a bare "git" match the "git " prefix, so the gate
 // cannot be stepped around by leaving the arguments off.
@@ -211,7 +233,7 @@ const TOOLS = {
     confirm: ({ command }) => {
       const wanted = typeof command === "string" ? command.trim() : "";
 
-      if (!wanted || hasShellMetacharacters(wanted)) {
+      if (!wanted || hasShellMetacharacters(wanted) || escapesWorkspace(wanted)) {
         return null;
       }
 
@@ -253,6 +275,17 @@ const TOOLS = {
         return {
           ok: false,
           error: `"${command}" has shell characters I won't run. Ask for one plain command.`,
+        };
+      }
+
+      // Every command, confirmed or not: a spoken yes is permission to run
+      // something, not permission to run it somewhere else.
+      if (escapesWorkspace(command)) {
+        logError(`[TOOL] BLOCKED, leaves the workspace: ${preview(command, 120)}`);
+
+        return {
+          ok: false,
+          error: `"${command}" points outside the project workspace. I can only work on files in there, named with relative paths.`,
         };
       }
 

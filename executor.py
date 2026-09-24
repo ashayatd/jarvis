@@ -138,6 +138,18 @@ def _project_path(name):
     return slug, None
 
 
+# The same confinement the Node side applies, repeated here on purpose. The
+# note on run_command below says it plainly: if this is ever reached without
+# the Node service in front of it, the allowlist is gone and this is the only
+# check left. Keeping it in both places costs one function.
+_ABSOLUTE_PATH = re.compile(r"""(?:^|[\s"'(=])(?:[A-Za-z]:|\\)""")
+_TRAVERSAL = re.compile(r"\.\.")
+
+
+def _escapes_workspace(command):
+    return bool(_ABSOLUTE_PATH.search(command) or _TRAVERSAL.search(command))
+
+
 def _resolve_within_workspace(relative):
     """Absolute path for a workspace-relative directory, or None if it escapes.
 
@@ -286,11 +298,20 @@ def execute():
         if not shell_command:
             return jsonify({"ok": False, "error": "No command provided."}), 400
 
-        # shell=True runs whatever arrives here. Two things keep that safe and
-        # both have to stay true: the Node side allowlists commands before they
-        # are sent, and Flask binds 127.0.0.1 so nothing off this machine can
-        # reach it. If this is ever put behind a tunnel it needs its own
-        # allowlist - the Node one would no longer be in the path.
+        if _escapes_workspace(shell_command):
+            print(f"[EXEC] REFUSED, leaves the workspace: {shell_command}")
+            return jsonify({
+                "ok": False,
+                "error": f"'{shell_command}' names a path outside the workspace.",
+            }), 400
+
+        # shell=True runs whatever arrives here. Three things keep that safe:
+        # the Node side allowlists commands before they are sent, Flask binds
+        # 127.0.0.1 so nothing off this machine can reach it, and the check
+        # above confines the command to the workspace whether or not the Node
+        # side ran. If this is ever put behind a tunnel it still wants its own
+        # allowlist - the confinement check limits where a command can reach,
+        # not which commands may run.
         print(f"[EXEC] running: {shell_command}")
 
         try:
@@ -320,6 +341,13 @@ def execute():
 
         if not shell_command:
             return jsonify({"ok": False, "error": "No command provided."}), 400
+
+        if _escapes_workspace(shell_command):
+            print(f"[EXEC] REFUSED, leaves the workspace: {shell_command}")
+            return jsonify({
+                "ok": False,
+                "error": f"'{shell_command}' names a path outside the workspace.",
+            }), 400
 
         return jsonify(
             {"ok": True, "status": "running", "job_id": _start_job(shell_command, use_shell=True)}
