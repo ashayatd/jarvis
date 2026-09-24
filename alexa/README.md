@@ -65,8 +65,9 @@ Leaving the intent out is the reliable fix.
    **JSON Editor**.
 2. Replace the whole document with `interaction-model.json`.
 3. Check `invocationName` matches the invocation name the skill already has.
-   This file assumes **"ai mode"**; if yours differs, change it here rather
-   than in the console, so the two stay in step.
+   This file says **"pluto"**, taken from the skill's own launch greeting; if
+   yours differs, change it here rather than in the console, so the two stay in
+   step.
 4. **Save Model**, then **Build Model**. Wait for the build to finish.
 5. Endpoint is unchanged — it still points at the tunnel to this service.
 

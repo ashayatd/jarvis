@@ -1,7 +1,7 @@
 {
   "interactionModel": {
     "languageModel": {
-      "invocationName": "ai mode",
+      "invocationName": "pluto",
       "intents": [
         {
           "name": "AMAZON.CancelIntent",

@@ -138,6 +138,31 @@ def _project_path(name):
     return slug, None
 
 
+def _resolve_within_workspace(relative):
+    """Absolute path for a workspace-relative directory, or None if it escapes.
+
+    Every segment goes through _slug, which is what makes this safe rather
+    than merely careful: a segment cannot come back as "..", as a drive letter
+    or as a separator, so there is nothing left to traverse with. An empty or
+    missing value means the workspace root, which is the old behaviour.
+    """
+    segments = [_slug(part) for part in re.split(r"[/\\]+", str(relative or ""))]
+    segments = [part for part in segments if part]
+    root = os.path.abspath(WORKDIR)
+
+    if not segments:
+        return root
+
+    candidate = os.path.abspath(os.path.join(root, *segments))
+
+    # Belt to the braces above: if _slug is ever loosened, this still holds.
+    if candidate != root and not candidate.startswith(root + os.sep):
+        print(f"[EXEC] REFUSED cwd outside workspace: {relative}")
+        return None
+
+    return candidate
+
+
 def _launch_vscode(path):
     subprocess.run(f'{VSCODE_BIN} "{path}"', shell=True, cwd=path)
 
@@ -171,7 +196,7 @@ def _finish(job_id, status, **fields):
         job.update(fields)
 
 
-def _run_job(job_id, command, use_shell, label):
+def _run_job(job_id, command, use_shell, label, cwd=None):
     started = time.time()
     print(f"[EXEC] {job_id} running: {label}")
 
@@ -182,7 +207,7 @@ def _run_job(job_id, command, use_shell, label):
             capture_output=True,
             text=True,
             timeout=JOB_TIMEOUT_S,
-            cwd=WORKDIR,
+            cwd=cwd or WORKDIR,
             # Without this an interactive prompt (the Claude CLI asking to
             # trust a folder, say) waits on a stdin that nobody will ever
             # write to, and the job hangs until the timeout instead of
@@ -218,7 +243,7 @@ def _run_job(job_id, command, use_shell, label):
         )
 
 
-def _start_job(command, use_shell=True, label=None):
+def _start_job(command, use_shell=True, label=None, cwd=None):
     _sweep_jobs()
 
     job_id = f"x{uuid.uuid4().hex[:8]}"
@@ -228,13 +253,14 @@ def _start_job(command, use_shell=True, label=None):
         _jobs[job_id] = {
             "status": "running",
             "command": label,
+            "cwd": cwd or WORKDIR,
             "started_at": time.time(),
             "finished_at": None,
         }
 
     # Daemon, so a stuck job cannot keep the executor alive on shutdown.
     threading.Thread(
-        target=_run_job, args=(job_id, command, use_shell, label), daemon=True
+        target=_run_job, args=(job_id, command, use_shell, label, cwd), daemon=True
     ).start()
 
     return job_id
@@ -389,6 +415,25 @@ def execute():
         if not prompt:
             return jsonify({"ok": False, "error": "No prompt provided."}), 400
 
+        # Where the CLI runs is what decides where the files land, since it
+        # acts on its own working directory. Absent means the workspace root,
+        # which is where everything went before this was a parameter.
+        requested = data.get("args", {}).get("cwd", "")
+        job_cwd = _resolve_within_workspace(requested)
+
+        if job_cwd is None:
+            return jsonify({"ok": False, "error": f"'{requested}' is outside the workspace."}), 400
+
+        # Deliberately not created here. Making a project directory is
+        # init_project's job, and that one is confirmed out loud - having
+        # run_claude quietly create it would walk around that.
+        if not os.path.isdir(job_cwd):
+            return jsonify({
+                "ok": False,
+                "error": f"There is no '{requested}' in the workspace yet - create the project first.",
+                "projects": _list_projects()[:20],
+            })
+
         argv = [CLAUDE_BIN, "-p"]
 
         if CLAUDE_PERMISSION_MODE:
@@ -398,9 +443,12 @@ def execute():
         # read as a flag.
         argv.append(prompt)
 
-        job_id = _start_job(argv, use_shell=False, label=f"claude: {prompt}")
+        where = os.path.relpath(job_cwd, os.path.abspath(WORKDIR))
+        label = f"claude: {prompt}" if where == "." else f"claude in {where}: {prompt}"
 
-        return jsonify({"ok": True, "status": "running", "job_id": job_id})
+        job_id = _start_job(argv, use_shell=False, label=label, cwd=job_cwd)
+
+        return jsonify({"ok": True, "status": "running", "job_id": job_id, "cwd": job_cwd})
 
     if command == "job_status":
         job_id = data.get("args", {}).get("job_id", "")

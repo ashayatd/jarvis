@@ -56,6 +56,10 @@ const claudeCall = (prompt) => ({
   function: { name: "run_claude", arguments: JSON.stringify({ prompt }) },
 });
 
+const claudeCallIn = (prompt, cwd) => ({
+  function: { name: "run_claude", arguments: JSON.stringify({ prompt, cwd }) },
+});
+
 const runClaude = (prompt) => runTool(claudeCall(prompt), { confirmed: true });
 
 const countSuffix = (prompt) =>
@@ -107,4 +111,40 @@ test("an unconfirmed call sends nothing at all", async () => {
 
   assert.equal(result.ok, false);
   assert.equal(started.length, 0);
+});
+
+// --- the project working directory ---------------------------------------
+
+test("cwd is forwarded to the executor", async () => {
+  started.length = 0;
+  await runTool(claudeCallIn("add a hero section", "landing page"), { confirmed: true });
+
+  assert.equal(started[0].cwd, "landing page");
+});
+
+test("no cwd means none is sent, so the executor keeps its default", async () => {
+  started.length = 0;
+  await runClaude("just answer a question");
+
+  assert.ok(!("cwd" in started[0]));
+});
+
+test("a null cwd is treated as absent, not sent as null", async () => {
+  started.length = 0;
+  await runTool(claudeCallIn("add a hero section", null), { confirmed: true });
+
+  assert.ok(!("cwd" in started[0]));
+});
+
+test("the confirmation says where the files will land", () => {
+  const held = confirmationFor(claudeCallIn("add a hero section", "landing page"));
+
+  assert.equal(held.command, "Claude with: add a hero section, in landing page");
+});
+
+test("the confirmation stays short when there is no project", () => {
+  const held = confirmationFor(claudeCall("just answer a question"));
+
+  assert.equal(held.command, "Claude with: just answer a question");
+  assert.doesNotMatch(held.command, /, in /);
 });

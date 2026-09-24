@@ -34,7 +34,8 @@ process.env.EXECUTOR_CLAUDE_BIN = process.execPath;
 // executor.py reads .env, where this is also configured, and an existing
 // environment variable is what wins over it.
 const workspace = path.join(os.tmpdir(), `jarvis-test-workspace-${process.pid}`);
-fs.mkdirSync(path.join(workspace, "landing-page"), { recursive: true });
+fs.mkdirSync(path.join(workspace, "landing-page", "src"), { recursive: true });
+fs.writeFileSync(path.join(workspace, "notes.txt"), "hello from the workspace");
 process.env.EXECUTOR_WORKDIR = workspace;
 
 // Stops a real editor window opening for every case that reaches VS Code.
@@ -413,28 +414,35 @@ test("a fallback asks the user to repeat without teaching a carrier phrase", asy
   assert.match(r.text, /say it again/i);
 });
 
-test("a run of fallbacks escalates to advice that works on any model", async () => {
-  await sayIntent("b4b", "AMAZON.FallbackIntent");
+test("a run of fallbacks escalates instead of repeating one line", async () => {
+  const first = await sayIntent("b4b", "AMAZON.FallbackIntent");
   const second = await sayIntent("b4b", "AMAZON.FallbackIntent");
   const third = await sayIntent("b4b", "AMAZON.FallbackIntent");
 
-  // Repeating one useless line is the thing being complained about. The way
-  // out has to be offered, even though it is a workaround for a stale model.
-  assert.match(second.text, /tell me/i);
-  assert.match(third.text, /tell me/i);
+  // Asserted on the mechanism rather than the words, so rewording the spoken
+  // copy does not fail the test: the second reply has to differ from the
+  // first, and then stay put. Repeating one useless line is the complaint.
+  assert.notEqual(second.text, first.text);
+  assert.equal(third.text, second.text);
+  assert.ok(second.text.length > 0);
   assert.equal(second.end, false);
 });
 
 test("one understood utterance clears the streak", async () => {
+  // What a first fallback sounds like, from a session with no history.
+  const { text: firstTimeText } = await sayIntent("b4d", "AMAZON.FallbackIntent");
+
   await sayIntent("b4c", "AMAZON.FallbackIntent");
-  await sayIntent("b4c", "AMAZON.FallbackIntent");
+  const escalated = await sayIntent("b4c", "AMAZON.FallbackIntent");
+  assert.notEqual(escalated.text, firstTimeText);
 
   scripted.push({ role: "assistant", content: "Understood." });
   const good = await sayIntent("b4c", "AskIntent", { query: { name: "query", value: "what day is it" } });
   assert.equal(good.text, "Understood.");
 
+  // Back to the first-time wording, which is what a cleared streak means.
   const afterwards = await sayIntent("b4c", "AMAZON.FallbackIntent");
-  assert.match(afterwards.text, /say it again/i);
+  assert.equal(afterwards.text, firstTimeText);
 });
 
 // --- slot extraction ------------------------------------------------------
@@ -497,4 +505,75 @@ test("the system prompt carries the rule and the exact wording", async () => {
 
   assert.match(SYSTEM_PROMPT, /run_claude/);
   assert.ok(SYSTEM_PROMPT.includes(AUTONOMOUS_SUFFIX));
+});
+
+// --- reading a file ------------------------------------------------------
+
+test("type is on the allowlist and runs without confirmation", async () => {
+  const { confirmationFor, runTool } = await import("../src/tools/registry.js");
+  const call = { function: { name: "run_command", arguments: JSON.stringify({ command: "type notes.txt" }) } };
+
+  assert.equal(confirmationFor(call), null, "reading a file must not be gated");
+
+  const result = await runTool(call, {});
+
+  assert.equal(result.ok, true);
+  assert.match(result.output, /hello from the workspace/);
+});
+
+test("a relative read resolves inside the workspace, not the repo", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "run_command", arguments: JSON.stringify({ command: "type package.json" }) } },
+    {},
+  );
+
+  // package.json exists in the repo but not in the workspace, which is what
+  // proves the read happened in the workspace.
+  assert.match(result.output, /cannot find|not find the file/i);
+});
+
+// --- the project working directory, at the executor -----------------------
+
+const executorPost = async (command, args) => {
+  const res = await fetch(process.env.EXECUTOR_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Executor-Secret": SECRET },
+    body: JSON.stringify({ command, args }),
+  });
+
+  return { status: res.status, body: await res.json() };
+};
+
+test("a cwd naming a real project is used for the run", async () => {
+  const { body } = await executorPost("start_claude", { prompt: "1+1", cwd: "landing page" });
+
+  assert.equal(body.ok, true);
+  assert.equal(body.cwd, path.join(workspace, "landing-page"));
+});
+
+test("a nested cwd resolves under the project", async () => {
+  const { body } = await executorPost("start_claude", { prompt: "1+1", cwd: "landing-page/src" });
+
+  assert.equal(body.cwd, path.join(workspace, "landing-page", "src"));
+});
+
+test("a cwd that does not exist is refused rather than created", async () => {
+  const { body } = await executorPost("start_claude", { prompt: "1+1", cwd: "invented project" });
+
+  assert.equal(body.ok, false);
+  assert.match(body.error, /no 'invented project'/);
+  assert.ok(!fs.existsSync(path.join(workspace, "invented-project")));
+});
+
+test("a cwd cannot escape the workspace", async () => {
+  const { body } = await executorPost("start_claude", {
+    prompt: "1+1",
+    cwd: "../../Windows/System32",
+  });
+
+  // Slugified into harmless nonsense inside the workspace, which then does not
+  // exist - so it is refused rather than run anywhere.
+  assert.equal(body.ok, false);
+  assert.match(body.error, /workspace/);
 });

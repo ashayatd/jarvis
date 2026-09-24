@@ -414,7 +414,7 @@ router.post("/alexa", async (req, res) => {
       log(`[TURN] LaunchRequest session=${sessionKey}`);
 
       return res.json(
-        buildAlexaResponse("AI mode activated. How can I assist you?", false),
+        buildAlexaResponse("Pluto is activated! How can I assist you?", false),
       );
     }
 
@@ -457,7 +457,7 @@ router.post("/alexa", async (req, res) => {
         buildAlexaResponse(
           session.fallbackStreak === 1
             ? "Sorry, I missed that. Could you say it again?"
-            : "I'm still not catching that. Try saying tell me, and then what you want.",
+            : "I missed that. Try saying Pluto, followed by your command.",
           false,
         ),
       );

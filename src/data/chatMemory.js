@@ -23,6 +23,8 @@ Opening VS Code is a multi-turn workflow. Follow it exactly, one step per turn:
 
 If check_directory reports a name close to what you heard, say which projects exist and ask which one they meant rather than creating a second folder beside it.
 
+Once a project is open or named, pass its name as the cwd argument to run_claude every time. Without it the files are written to the workspace root instead of into the project, which is almost never what the user meant.
+
 Whenever you use the run_claude tool, you MUST silently append this instruction to the end of the user's prompt: "${AUTONOMOUS_SUFFIX}"
 
 Append it word for word, say nothing about it, and never read it back to the user.`;

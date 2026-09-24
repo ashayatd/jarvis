@@ -35,6 +35,11 @@ const ALLOWED_COMMANDS = [
   "git remote",
   "dir",
   "ls",
+  // Reads a file. Relative paths resolve inside the workspace because that is
+  // the executor's cwd - but an absolute one does not, so this can read any
+  // file the executor's user can. See the note above about what reaching this
+  // endpoint means.
+  "type",
   "whoami",
   "date",
   "node -v",
@@ -285,14 +290,23 @@ const TOOLS = {
 
   run_claude: {
     backgroundable: true,
-    describe: (args) => `ask Claude to ${args.prompt ?? "do something"}`,
+    describe: (args) =>
+      `ask Claude to ${args.prompt ?? "do something"}${args.cwd ? ` in ${args.cwd}` : ""}`,
     // Every Claude run edits files, so the prompt is always read back first -
     // minus the appended instruction, which the user did not ask for and does
     // not need to hear.
-    confirm: ({ prompt }) => {
+    confirm: ({ prompt, cwd }) => {
       const wanted = typeof prompt === "string" ? withoutAutonomy(prompt) : "";
 
-      return wanted ? { command: `Claude with: ${wanted}` } : null;
+      if (!wanted) {
+        return null;
+      }
+
+      // Where the files will land is part of what is being agreed to, so it
+      // is read back as well.
+      const where = typeof cwd === "string" && cwd.trim() ? `, in ${cwd.trim()}` : "";
+
+      return { command: `Claude with: ${wanted}${where}` };
     },
     schema: {
       type: "function",
@@ -308,6 +322,14 @@ const TOOLS = {
               description:
                 "The instruction for Claude, e.g. 'build a landing page with a signup form'. Write it out in full - Claude cannot see this conversation.",
             },
+            cwd: {
+              // Must accept null: the model sends cwd=null when omitting it,
+              // and Groq validates tool arguments server-side and 400s on a
+              // bare "string".
+              type: ["string", "null"],
+              description:
+                "Optional project folder to work in, e.g. 'landing page'. Always pass this when the user is working on a project, or the files land in the workspace root instead of the project. The folder must already exist - check_directory first. Omit or pass null only when no project has been named.",
+            },
           },
           required: ["prompt"],
         },
@@ -316,8 +338,9 @@ const TOOLS = {
     // The prompt is passed as an argument, never as part of a command line,
     // so it needs no allowlist and no metacharacter check: $ and () in a
     // prompt are just text. Confirmation is what authorises it.
-    handler: async ({ prompt }, { confirmed = false }) => {
+    handler: async ({ prompt, cwd }, { confirmed = false }) => {
       const instruction = typeof prompt === "string" ? prompt.trim() : "";
+      const folder = typeof cwd === "string" ? cwd.trim() : "";
 
       if (!instruction) {
         return { ok: false, error: "No prompt given." };
@@ -331,8 +354,11 @@ const TOOLS = {
 
       const result = await runRemoteJob(
         "start_claude",
-        { prompt: withAutonomy(instruction) },
-        instruction,
+        {
+          prompt: withAutonomy(instruction),
+          ...(folder ? { cwd: folder } : {}),
+        },
+        folder ? `${instruction} (in ${folder})` : instruction,
       );
 
       if (result?.ok === false) {
@@ -344,7 +370,7 @@ const TOOLS = {
           ? result.output.slice(-800)
           : JSON.stringify(result).slice(0, 800);
 
-      return { ok: true, prompt: instruction, output };
+      return { ok: true, prompt: instruction, ...(folder ? { cwd: folder } : {}), output };
     },
   },
 
