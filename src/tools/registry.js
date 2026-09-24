@@ -24,55 +24,65 @@ const APP_COMMANDS = {
   "spotify": "open_spotify",
 };
 
-// Commands that may run with no confirmation. Matched on a prefix with a space
-// boundary, so an entry permits its own arguments - "npm run" covers "npm run
-// build" - but never a longer word: "node" does not match "nodemon". An entry
-// is therefore a promise about everything that can follow it.
+// Everything run_command may run, and all of it runs immediately - there is no
+// confirmation step any more. Matched on a prefix with a space boundary, so an
+// entry permits its own arguments ("npm" covers "npm run build") but never a
+// longer word ("node" does not match "nodemon"). An entry is therefore a
+// promise about everything that can follow it.
 //
-// Wide enough to start a project of any shape, which is the point, and that
-// makes this the main thing standing between the tunnel and arbitrary code
-// execution. Two rules keep it honest, both enforced on every command below:
-// no shell metacharacters, and nothing outside the workspace. "npx" is the
-// loosest entry by far - it fetches and runs code from the registry, which no
-// local rule can vet. Moving it to MUTATING_PREFIXES is the one-line change if
-// that trade stops being worth it.
+// This list is now the only thing deciding what may run, so read it as the
+// answer to "what can Pluto do to this machine". Two rules still apply to every
+// command below, and they are what keeps the list honest: no shell
+// metacharacters, so nothing can be chained, and no absolute path or "..", so
+// nothing outside the workspace can be named.
+//
+// "start" and "npx" are the widest entries by a distance. "start" launches
+// whatever is registered for what follows it, and "npx" fetches and runs code
+// from the registry - once that is a subprocess, no rule here constrains what
+// it does. Narrowing either is a one-line change in this list.
 const ALLOWED_PREFIXES = [
-  // Reading the repo.
+  // Reading the workspace and the machine. Relative paths only - an absolute
+  // one is rejected before this is reached.
+  "dir",
+  "ls",
+  "type",
+  "whoami",
+  "date",
+  // Running a project, whatever it happens to be built with, and opening it.
+  "node",
+  "python",
+  "npx",
+  "start",
+  // The repo and its packages. These change things - they were held for a
+  // spoken yes until autonomy replaced the gate.
+  "git",
+  "npm",
+];
+
+// Commands that finish in a moment and can be answered inline. Everything else
+// allowed is treated as long-running and sent down the job path instead,
+// because inline means the executor's 15 second ceiling - which would kill a
+// dev server just as it finished booting and report it as a timeout.
+//
+// Stated as the short list rather than the long one so a new entry above is
+// slow by default: waiting a little too long for an answer is a much smaller
+// problem than a killed server reported as a failure.
+const INSTANT_PREFIXES = [
   "git status",
   "git log",
   "git branch",
   "git diff",
   "git remote",
-  // Reading the workspace. Relative paths only - an absolute one is rejected
-  // before this is reached, so this cannot read outside the workspace.
   "dir",
   "ls",
   "type",
-  // Asking the machine about itself.
   "whoami",
   "date",
   "node -v",
   "npm -v",
-  // Running a project, whatever it happens to be built with.
-  "npm start",
-  "npm run",
-  "node",
-  "python",
-  "npx",
+  // Launching the browser hands off and returns; it does not wait for the page.
+  "start",
 ];
-
-// Opening the result in the browser. Not in the list above because the space
-// boundary there does not fit: "start http://localhost:3000" has no space
-// after "http", so a prefix entry would never match it. A pattern is a better
-// fit anyway - it pins the argument to a single http or https URL, so this
-// cannot become "start notepad.exe" or "start ." and launch something.
-const BROWSER_URL = /^start https?:\/\/\S*$/;
-
-// These do not finish on their own - a dev server runs until something stops
-// it. Sent as background jobs rather than inline, because inline means the
-// executor's 15 second ceiling, which would kill a server just as it finished
-// booting and then report it as a timeout.
-const LONG_RUNNING_PREFIXES = ["npm start", "npm run", "node", "python", "npx"];
 
 const matchesPrefix = (command, prefixes) => {
   const normalized = command.trim().toLowerCase();
@@ -82,10 +92,8 @@ const matchesPrefix = (command, prefixes) => {
   );
 };
 
-// Commands that change something: the repo, the installed packages, or files
-// on disk by way of the Claude CLI. These are never run on the model's word
-// alone - the user has to say yes out loud first. Prefix match, so "git "
-// gates every git subcommand, the read-only ones included.
+// Kept only to name the commands that change something, for the tool
+// description. Nothing gates on it any more: these run like anything else.
 export const MUTATING_PREFIXES = ["git ", "npm ", "npx ", "claude "];
 
 // Chaining defeats prefix matching on its own: "git status && rm -rf ."
@@ -115,43 +123,19 @@ const TRAVERSAL = /\.\./;
 export const escapesWorkspace = (command) =>
   ABSOLUTE_PATH.test(command) || TRAVERSAL.test(command);
 
-// The trailing space makes a bare "git" match the "git " prefix, so the gate
-// cannot be stepped around by leaving the arguments off.
-const isMutating = (command) => {
-  const normalized = `${String(command ?? "").trim().toLowerCase()} `;
-
-  return MUTATING_PREFIXES.some((prefix) => normalized.startsWith(prefix));
-};
-
 // Both exported for the same reason as escapesWorkspace: a prefix list is a
 // set of promises about what may follow each entry, and that is worth asserting
 // directly rather than only through whatever a tool does with the answer.
-export const isAllowed = (command) =>
-  matchesPrefix(command, ALLOWED_PREFIXES) ||
-  BROWSER_URL.test(command.trim().toLowerCase());
+export const isAllowed = (command) => matchesPrefix(command, ALLOWED_PREFIXES);
 
-export const isLongRunning = (command) => matchesPrefix(command, LONG_RUNNING_PREFIXES);
+export const isLongRunning = (command) => !matchesPrefix(command, INSTANT_PREFIXES);
 
-// What has to be confirmed before this tool call may run, or null if it can
-// go straight through. The policy lives on each tool as `confirm`, so a tool
-// and the rule that gates it cannot drift apart. A tool with no `confirm`
-// never gates.
-//
-// `prompt` is what the user hears. A tool that leaves it out gets the default
-// "That will run X" wording; one that sets it asks its own question, which is
-// how the VS Code flow gets to ask about initialising a repo instead.
-export const confirmationFor = (toolCall) => {
-  const tool = TOOLS[toolCall?.function?.name];
-  const args = parseToolArgs(toolCall);
-
-  if (!tool?.confirm || args === null) {
-    return null;
-  }
-
+// What to say while a job is still running, so the reprompt can narrate the
+// work instead of repeating one line. Lives on the tool next to `describe` for
+// the same reason: the tool knows what it is doing, the route does not.
+export const narrateToolCall = (toolName, args) => {
   try {
-    const held = tool.confirm(args);
-
-    return held ? { ...held, toolCall } : null;
+    return TOOLS[toolName]?.narrate?.(args ?? {}) ?? null;
   } catch {
     return null;
   }
@@ -260,24 +244,8 @@ const TOOLS = {
   run_command: {
     backgroundable: true,
     describe: (args) => `run "${args.command ?? "a command"}"`,
-    // Read-only commands skip the gate even when they match a mutating
-    // prefix: "git status" is on the allowlist for a reason, and making the
-    // user confirm it turns every status check into two turns for nothing.
-    // The handler below checks these in the same order - if they disagreed,
-    // the gate would hold a command the handler was going to run anyway.
-    confirm: ({ command }) => {
-      const wanted = typeof command === "string" ? command.trim() : "";
-
-      if (!wanted || hasShellMetacharacters(wanted) || escapesWorkspace(wanted)) {
-        return null;
-      }
-
-      if (isAllowed(wanted) || !isMutating(wanted)) {
-        return null;
-      }
-
-      return { command: wanted };
-    },
+    narrate: ({ command, cwd }) =>
+      `${command ?? "that command"} is still running${cwd ? ` in ${cwd}` : ""}`,
     schema: {
       type: "function",
       function: {
@@ -304,10 +272,7 @@ const TOOLS = {
         },
       },
     },
-    // `confirmed` is set only by the route handler, and only once the user has
-    // said yes to this exact command. It is the only way a mutating command
-    // reaches the executor.
-    handler: async ({ command, cwd }, { timeoutMs, confirmed = false }) => {
+    handler: async ({ command, cwd }, { timeoutMs }) => {
       if (!command) {
         return { ok: false, error: "No command given." };
       }
@@ -323,8 +288,8 @@ const TOOLS = {
         };
       }
 
-      // Every command, confirmed or not: a spoken yes is permission to run
-      // something, not permission to run it somewhere else.
+      // The rule that survived autonomy. Nothing asks the user any more, so
+      // this is what decides where a command can reach.
       if (escapesWorkspace(command)) {
         logError(`[TOOL] BLOCKED, leaves the workspace: ${preview(command, 120)}`);
 
@@ -334,11 +299,9 @@ const TOOLS = {
         };
       }
 
-      // Allowlist first, so a read-only command runs instantly even though it
-      // matches a mutating prefix. Same order as confirmationFor.
-      const readOnly = isAllowed(command);
-
-      if (!readOnly && !(isMutating(command) && confirmed)) {
+      // The allowlist is now the whole decision - there is no second chance
+      // for a command to be permitted by being confirmed.
+      if (!isAllowed(command)) {
         logError(`[TOOL] BLOCKED by allowlist: ${preview(command, 120)}`);
 
         return {
@@ -351,14 +314,12 @@ const TOOLS = {
       const label = folder ? `${command} (in ${folder})` : command;
 
       // Inline only when it will actually finish. A dev server would hit the
-      // executor's 15 second ceiling and be killed, so anything long-running
-      // goes down the job path even though it needed no confirmation - the
-      // spoken reply then says it started rather than waiting for an end that
-      // is not coming.
-      const result =
-        readOnly && !isLongRunning(command)
-          ? await execute("run_command", args, { timeoutMs })
-          : await runRemoteJob("start_command", args, label);
+      // executor's 15 second ceiling and be killed, so anything not on the
+      // instant list goes down the job path - the spoken reply then says it
+      // started rather than waiting for an end that is not coming.
+      const result = isLongRunning(command)
+        ? await runRemoteJob("start_command", args, label)
+        : await execute("run_command", args, { timeoutMs });
 
       if (result?.ok === false) {
         return result;
@@ -379,28 +340,19 @@ const TOOLS = {
     backgroundable: true,
     describe: (args) =>
       `ask Claude to ${args.prompt ?? "do something"}${args.cwd ? ` in ${args.cwd}` : ""}`,
-    // Every Claude run edits files, so the prompt is always read back first -
-    // minus the appended instruction, which the user did not ask for and does
-    // not need to hear.
-    confirm: ({ prompt, cwd }) => {
-      const wanted = typeof prompt === "string" ? withoutAutonomy(prompt) : "";
-
-      if (!wanted) {
-        return null;
-      }
-
-      // Where the files will land is part of what is being agreed to, so it
-      // is read back as well.
-      const where = typeof cwd === "string" && cwd.trim() ? `, in ${cwd.trim()}` : "";
-
-      return { command: `Claude with: ${wanted}${where}` };
-    },
+    // The appended instruction is stripped, because it is boilerplate the user
+    // never asked for and would otherwise be narrated back at them every time
+    // the reprompt fires.
+    narrate: ({ prompt, cwd }) =>
+      `Claude is currently building ${withoutAutonomy(String(prompt ?? "that"))}${
+        cwd ? ` in ${cwd}` : ""
+      }`,
     schema: {
       type: "function",
       function: {
         name: "run_claude",
         description:
-          "Hand a coding or file-editing task to the Claude CLI on the user's PC. Use this for anything that writes, edits, refactors, explains or reviews code - it is the only tool that can change files. Pass the user's request as the prompt, in full and in plain English, and append the instruction the system prompt gives you for this tool. The user is asked to confirm out loud before it runs, and the work takes minutes, so it usually finishes in the background.",
+          "Hand a coding or file-editing task to the Claude CLI on the user's PC. Use this for anything that writes, edits, refactors, explains or reviews code - it is the only tool that can change files. Pass the user's request as the prompt, in full and in plain English, and append the instruction the system prompt gives you for this tool. It runs straight away without asking, and takes minutes, so say what you are starting and let it finish in the background.",
         parameters: {
           type: "object",
           properties: {
@@ -425,18 +377,13 @@ const TOOLS = {
     // The prompt is passed as an argument, never as part of a command line,
     // so it needs no allowlist and no metacharacter check: $ and () in a
     // prompt are just text. Confirmation is what authorises it.
-    handler: async ({ prompt, cwd }, { confirmed = false }) => {
+    // No timeoutMs: this always goes down the job path, which sets its own.
+    handler: async ({ prompt, cwd }) => {
       const instruction = typeof prompt === "string" ? prompt.trim() : "";
       const folder = typeof cwd === "string" ? cwd.trim() : "";
 
       if (!instruction) {
         return { ok: false, error: "No prompt given." };
-      }
-
-      if (!confirmed) {
-        logError(`[TOOL] BLOCKED, unconfirmed Claude run: ${preview(instruction, 120)}`);
-
-        return { ok: false, error: "The user has not confirmed this yet." };
       }
 
       const result = await runRemoteJob(
@@ -527,26 +474,13 @@ const TOOLS = {
   init_project: {
     backgroundable: true,
     describe: (args) => `start ${args.project ?? "a project"}`,
-    // Creates a directory and a repo, so it is gated - but with its own
-    // question, because "that project isn't present, should I initialise a
-    // new repo?" is the confirmation here. Asking in prose as well would make
-    // the user say yes twice.
-    confirm: ({ project }) => {
-      const wanted = typeof project === "string" ? project.trim() : "";
-
-      return wanted
-        ? {
-            command: `git init in ${wanted}`,
-            prompt: "That project isn't present. Should I initialize a new repo?",
-          }
-        : null;
-    },
+    narrate: ({ project }) => `setting up ${project ?? "a new project"}`,
     schema: {
       type: "function",
       function: {
         name: "init_project",
         description:
-          "Create a new project folder in the user's workspace, run git init inside it and open it in VS Code. Call this when check_directory reports the project does not exist. Do not ask in prose whether to create it first - the user is asked to confirm automatically, so asking yourself would make them confirm twice.",
+          "Create a new project folder in the user's workspace, run git init inside it and open it in VS Code. Call this when check_directory reports the project does not exist. Do not ask whether to create it - say that you are setting it up and call this.",
         parameters: {
           type: "object",
           properties: {
@@ -559,15 +493,9 @@ const TOOLS = {
         },
       },
     },
-    handler: async ({ project }, { timeoutMs, confirmed = false }) => {
+    handler: async ({ project }, { timeoutMs }) => {
       if (!project) {
         return { ok: false, error: "No project name given." };
-      }
-
-      if (!confirmed) {
-        logError(`[TOOL] BLOCKED, unconfirmed init: ${preview(project, 120)}`);
-
-        return { ok: false, error: "The user has not confirmed this yet." };
       }
 
       return execute("init_project", { project }, { timeoutMs });

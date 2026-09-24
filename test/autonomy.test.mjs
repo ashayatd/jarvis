@@ -44,7 +44,7 @@ await new Promise((resolve) => stub.listen(0, "127.0.0.1", resolve));
 process.env.EXECUTOR_URL = `http://127.0.0.1:${stub.address().port}/execute`;
 
 const { AUTONOMOUS_SUFFIX } = await import("../src/data/chatMemory.js");
-const { confirmationFor, runTool } = await import("../src/tools/registry.js");
+const { narrateToolCall, runTool } = await import("../src/tools/registry.js");
 
 before(() => {
   started.length = 0;
@@ -60,7 +60,7 @@ const claudeCallIn = (prompt, cwd) => ({
   function: { name: "run_claude", arguments: JSON.stringify({ prompt, cwd }) },
 });
 
-const runClaude = (prompt) => runTool(claudeCall(prompt), { confirmed: true });
+const runClaude = (prompt) => runTool(claudeCall(prompt), {});
 
 const countSuffix = (prompt) =>
   prompt.split(AUTONOMOUS_SUFFIX).length - 1;
@@ -98,26 +98,40 @@ test("a prompt full of shell metacharacters is passed through untouched", async 
   assert.ok(started[0].prompt.includes(awkward));
 });
 
-test("the instruction is stripped from what the user is asked to confirm", () => {
-  const held = confirmationFor(claudeCall(`build a landing page\n\n${AUTONOMOUS_SUFFIX}`));
+test("the instruction is stripped from what the reprompt narrates", () => {
+  // It used to be stripped from the confirmation. The confirmation is gone, but
+  // the reprompt now says the prompt out loud every time the user goes quiet,
+  // so the boilerplate still has to come off.
+  const narration = narrateToolCall("run_claude", {
+    prompt: `build a landing page\n\n${AUTONOMOUS_SUFFIX}`,
+  });
 
-  assert.equal(held.command, "Claude with: build a landing page");
-  assert.doesNotMatch(held.command, /autonomous developer/);
+  assert.equal(narration, "Claude is currently building build a landing page");
+  assert.doesNotMatch(narration, /autonomous developer/);
 });
 
-test("an unconfirmed call sends nothing at all", async () => {
+test("a call with no prompt sends nothing at all", async () => {
   started.length = 0;
-  const result = await runTool(claudeCall("delete everything"), {});
+  const result = await runTool(claudeCall(""), {});
 
   assert.equal(result.ok, false);
   assert.equal(started.length, 0);
+});
+
+test("a call runs without any confirmation being passed", async () => {
+  started.length = 0;
+  const result = await runTool(claudeCall("build something"), {});
+
+  assert.equal(result.ok, true);
+  assert.equal(started.length, 1);
+  assert.doesNotMatch(String(result.error ?? ""), /not confirmed/);
 });
 
 // --- the project working directory ---------------------------------------
 
 test("cwd is forwarded to the executor", async () => {
   started.length = 0;
-  await runTool(claudeCallIn("add a hero section", "landing page"), { confirmed: true });
+  await runTool(claudeCallIn("add a hero section", "landing page"), {});
 
   assert.equal(started[0].cwd, "landing page");
 });
@@ -131,20 +145,28 @@ test("no cwd means none is sent, so the executor keeps its default", async () =>
 
 test("a null cwd is treated as absent, not sent as null", async () => {
   started.length = 0;
-  await runTool(claudeCallIn("add a hero section", null), { confirmed: true });
+  await runTool(claudeCallIn("add a hero section", null), {});
 
   assert.ok(!("cwd" in started[0]));
 });
 
-test("the confirmation says where the files will land", () => {
-  const held = confirmationFor(claudeCallIn("add a hero section", "landing page"));
+test("the narration says where the work is happening", () => {
+  const narration = narrateToolCall("run_claude", {
+    prompt: "add a hero section",
+    cwd: "landing page",
+  });
 
-  assert.equal(held.command, "Claude with: add a hero section, in landing page");
+  assert.equal(narration, "Claude is currently building add a hero section in landing page");
 });
 
-test("the confirmation stays short when there is no project", () => {
-  const held = confirmationFor(claudeCall("just answer a question"));
+test("the narration stays short when there is no project", () => {
+  const narration = narrateToolCall("run_claude", { prompt: "just answer a question" });
 
-  assert.equal(held.command, "Claude with: just answer a question");
-  assert.doesNotMatch(held.command, /, in /);
+  assert.equal(narration, "Claude is currently building just answer a question");
+  assert.doesNotMatch(narration, / in /);
+});
+
+test("a tool with nothing to narrate returns nothing", () => {
+  assert.equal(narrateToolCall("check_job_status", {}), null);
+  assert.equal(narrateToolCall("no_such_tool", {}), null);
 });

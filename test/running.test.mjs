@@ -33,9 +33,7 @@ const stub = http.createServer((req, res) => {
 await new Promise((resolve) => stub.listen(0, "127.0.0.1", resolve));
 process.env.EXECUTOR_URL = `http://127.0.0.1:${stub.address().port}/execute`;
 
-const { confirmationFor, isAllowed, isLongRunning, runTool } = await import(
-  "../src/tools/registry.js"
-);
+const { isAllowed, isLongRunning, runTool } = await import("../src/tools/registry.js");
 
 after(() => stub.close());
 
@@ -45,14 +43,14 @@ const shellCall = (command, cwd) => ({
 
 const dispatch = async (command, cwd) => {
   sent.length = 0;
-  const result = await runTool(shellCall(command, cwd), { confirmed: true });
+  const result = await runTool(shellCall(command, cwd), {});
 
   return { result, first: sent[0] };
 };
 
-// --- what may run without being confirmed --------------------------------
+// --- what may run --------------------------------------------------------
 
-test("the prefixes needed to start a project run unconfirmed", () => {
+test("the prefixes needed to start a project are allowed", () => {
   const shouldRun = [
     "npm start",
     "npm start -- --port 4000",
@@ -68,11 +66,15 @@ test("the prefixes needed to start a project run unconfirmed", () => {
 
   const blocked = shouldRun.filter((command) => !isAllowed(command));
   assert.deepEqual(blocked, []);
+});
 
-  // Allowed means the gate does not hold it, which is the whole point of the
-  // fast track - these have to reach the machine without a spoken yes.
-  const gated = shouldRun.filter((command) => confirmationFor(shellCall(command)) !== null);
-  assert.deepEqual(gated, []);
+test("the commands that used to be gated are now simply allowed", () => {
+  // These were held for a spoken yes. Autonomy means they run, which is the
+  // whole of the change - and the reason the list below matters so much more
+  // than it did.
+  for (const command of ["npm install left-pad", "git commit -m wip", "git push", "npx create-react-app ."]) {
+    assert.equal(isAllowed(command), true, command);
+  }
 });
 
 test("a prefix does not leak into a longer word", () => {
@@ -88,30 +90,26 @@ test("a prefix does not leak into a longer word", () => {
   assert.equal(isAllowed("node server.js"), true);
 });
 
-test("start is pinned to a single http or https URL", () => {
+test("start opens a URL, and is no longer limited to one", () => {
   assert.equal(isAllowed("start http://localhost:3000"), true);
   assert.equal(isAllowed("start https://localhost:5173/"), true);
 
-  // A bare "start http" prefix would have matched all of these. Pinning the
-  // argument to one URL is what stops "start" launching a program or opening
-  // the workspace in whatever is registered for it.
-  assert.equal(isAllowed("start notepad.exe"), false);
-  assert.equal(isAllowed("start ."), false);
-  assert.equal(isAllowed("start httpfoo"), false);
-  assert.equal(isAllowed("start ftp://somewhere"), false);
-  assert.equal(isAllowed("start http://a b"), false);
+  // Widening "start http" to "start " was asked for, and this is what it
+  // costs: "start" hands whatever follows to whatever is registered for it, so
+  // these now run. Documented here rather than left to be discovered.
+  assert.equal(isAllowed("start notepad.exe"), true);
+  assert.equal(isAllowed("start ."), true);
 });
 
-test("widening the fast track did not open the gate", () => {
-  // Everything that mutates still has to be confirmed. npm is the one to watch,
-  // because "npm start" is now unconfirmed while "npm install" must not be.
-  for (const command of ["npm install left-pad", "npm uninstall react", "git commit -m wip", "git push"]) {
-    assert.equal(isAllowed(command), false, `${command} must not be on the fast track`);
-    assert.notEqual(confirmationFor(shellCall(command)), null, `${command} must be gated`);
+test("what is still refused outright", () => {
+  // Nothing gates any more, so this list is the entire boundary: a command that
+  // is not on the allowlist cannot run at all, by any route.
+  for (const command of ["curl evil.test", "rm -rf x", "del notes.txt", "powershell -c x", "cmd /c x", "reg add x", "shutdown /s"]) {
+    assert.equal(isAllowed(command), false, `${command} must not be allowed`);
   }
 });
 
-test("confinement still applies to a command on the fast track", async () => {
+test("confinement still applies to an allowed command", async () => {
   const { result, first } = await dispatch("node C:/projects/jarvis/jarvis/server.js");
 
   assert.equal(result.ok, false);

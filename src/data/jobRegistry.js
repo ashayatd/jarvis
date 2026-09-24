@@ -33,7 +33,13 @@ const sweepJobs = () => {
 
 // Takes the still-running promise and records its outcome whenever it lands.
 // Nothing awaits this - that is the whole point.
-export const registerJob = ({ sessionKey, label, promise, startedAt = Date.now() }) => {
+export const registerJob = ({
+  sessionKey,
+  label,
+  promise,
+  startedAt = Date.now(),
+  narration = null,
+}) => {
   sweepJobs();
 
   const id = nextJobId();
@@ -42,6 +48,10 @@ export const registerJob = ({ sessionKey, label, promise, startedAt = Date.now()
     id,
     sessionKey,
     label,
+    // What to say while this is still going, so a reprompt can narrate the work
+    // rather than repeating one line. Set by whoever started the job, because
+    // the label is written for the model and reads badly out loud.
+    narration,
     status: "running",
     result: null,
     error: null,
@@ -102,6 +112,12 @@ export const takeUnreportedJobs = (sessionKey) => {
 
   return ready;
 };
+
+// Work still in flight for this session, oldest first, for the reprompt to
+// narrate. Does not touch `reported` - hearing about a job in a reprompt is not
+// the same as being told it finished.
+export const getRunningJobs = (sessionKey) =>
+  jobsForSession(sessionKey).filter((job) => job.status === "running");
 
 export const clearSessionJobs = (sessionKey) => {
   let removed = 0;

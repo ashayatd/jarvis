@@ -11,6 +11,7 @@ import {
 import {
   clearSessionJobs,
   describeJob,
+  getRunningJobs,
   jobCount,
   registerJob,
   takeUnreportedJobs,
@@ -18,9 +19,9 @@ import {
 import { BACKGROUND_TIMEOUT_MS } from "../services/executorService.js";
 import { generateAIReply } from "../services/groqService.js";
 import {
-  confirmationFor,
   describeToolCall,
   isBackgroundable,
+  narrateToolCall,
   parseToolArgs,
   runTool,
   toolSchemas,
@@ -45,8 +46,42 @@ const TOOL_DEADLINE_MS = Number(process.env.TOOL_DEADLINE_MS || 3500);
 
 const DEADLINE = Symbol("deadline");
 
-// Spoken only if the user goes quiet with the mic still open.
-const REPROMPT_TEXT = "I'm listening.";
+// Spoken only if the user goes quiet with the mic still open, and only when
+// there is nothing running to talk about instead.
+const IDLE_REPROMPT = "I'm still here, let me know what to do next.";
+
+// Server local time, not the echo's. Alexa only reports the device timezone
+// through the Settings API, which is another round trip inside an 8 second
+// budget - fine while the PC and the speaker are in the same house, wrong for
+// anyone running this remotely.
+// Exported for the tests: the clock cannot be moved from outside, so the only
+// way to assert every branch is to call this with the hour directly.
+export const greetingFor = (hour) => {
+  if (hour >= 5 && hour < 12) return "Good morning! Pluto is here!!";
+  if (hour >= 12 && hour < 17) return "Good afternoon! Pluto is here!!";
+  if (hour >= 17 && hour < 22) return "Good evening! Pluto is here!!";
+
+  return "Working late! Pluto is here!!";
+};
+
+// What the mic-open reprompt should say right now. A job in flight is more
+// useful than a stock line - it is the only way the user hears that Claude is
+// still working without having to ask.
+export const repromptFor = (sessionKey) => {
+  const running = getRunningJobs(sessionKey);
+
+  if (!running.length) {
+    return IDLE_REPROMPT;
+  }
+
+  const [first] = running;
+  const elapsed = Math.round((Date.now() - first.startedAt) / 1000);
+  const what = first.narration || first.label || "something";
+  const others =
+    running.length > 1 ? ` I have ${running.length - 1} other job running too.` : "";
+
+  return `${what}, about ${elapsed} seconds in.${others} I'll tell you when it lands.`;
+};
 
 // Matched exactly, not by substring, so "thanks for that, now open vs code"
 // stays a normal turn.
@@ -77,11 +112,6 @@ const BUILTIN_ENDINGS = new Set(["AMAZON.StopIntent", "AMAZON.CancelIntent"]);
 
 const HELP_TEXT =
   "Ask me anything, or say open VS Code to work on a project. I can also run git commands and hand coding jobs to Claude. What would you like?";
-
-// Exact match again, and deliberately short: a confirmation has to be an
-// unambiguous yes and nothing else, because the next thing that happens is a
-// command running on the user's PC.
-const CONFIRMATIONS = new Set(["yes", "yeah", "yep", "do it", "confirm"]);
 
 // An interaction model with a bare {query} sample puts the whole utterance in
 // the slot, carrier phrase and all, so "tell me stop" arrives where "stop"
@@ -123,9 +153,8 @@ const sweepSessions = () => {
   }
 };
 
-// Returns the whole entry, not just the memory: a command held at the
-// confirmation gate has to survive from the turn that proposed it to the turn
-// that answers yes, and the session is the only thing that spans both.
+// Returns the whole entry, not just the memory: the run of missed utterances is
+// counted per session, so it has to live somewhere that spans turns.
 const getSession = (req) => {
   sweepSessions();
 
@@ -133,7 +162,7 @@ const getSession = (req) => {
   let entry = sessions.get(key);
 
   if (!entry) {
-    entry = { memory: createChatMemory(), lastSeen: Date.now(), pendingAction: null };
+    entry = { memory: createChatMemory(), lastSeen: Date.now(), fallbackStreak: 0 };
     sessions.set(key, entry);
     log(`[SESS] new session=${key} (${sessions.size} active)`);
   } else {
@@ -159,29 +188,61 @@ const forSpeech = (text) => {
   return cleaned || "Sorry, I didn't get that.";
 };
 
-const buildAlexaResponse = (text, shouldEndSession = false) => {
+// The interjections are SSML, and SSML in a PlainText response is read out as
+// words - "say as interpret as interjection hmm". So responses are SSML now,
+// which brings a problem PlainText did not have: one stray "&" anywhere makes
+// the document invalid and Alexa answers "there was a problem with the
+// requested skill's response" instead of speaking at all. Tool output goes
+// through here - git output, file contents - so that is a real risk, not a
+// theoretical one.
+//
+// Everything is escaped first and then the handful of tags worth allowing are
+// put back. An allowlist, so a tag the model invents cannot break the document.
+const SSML_TAGS = [
+  [/&lt;say-as interpret-as="interjection"&gt;/g, '<say-as interpret-as="interjection">'],
+  [/&lt;\/say-as&gt;/g, "</say-as>"],
+  [/&lt;break time="(\d{1,4}m?s)"\s*\/?&gt;/g, '<break time="$1"/>'],
+  [/&lt;emphasis level="(strong|moderate|reduced)"&gt;/g, '<emphasis level="$1">'],
+  [/&lt;\/emphasis&gt;/g, "</emphasis>"],
+];
+
+export const toSsml = (text) => {
+  let escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  for (const [pattern, tag] of SSML_TAGS) {
+    escaped = escaped.replace(pattern, tag);
+  }
+
+  return `<speak>${escaped}</speak>`;
+};
+
+const speech = (text) => ({ type: "SSML", ssml: toSsml(text) });
+
+const buildAlexaResponse = (text, shouldEndSession = false, sessionKey = null) => {
   const spoken = forSpeech(text);
 
   log(`[SAY ] "${spoken}"${shouldEndSession ? " [END SESSION]" : " [MIC OPEN]"}`);
 
   const response = {
-    outputSpeech: {
-      type: "PlainText",
-      text: spoken,
-    },
+    outputSpeech: speech(spoken),
     shouldEndSession,
   };
 
   // Without a reprompt Alexa closes the mic after speaking, forcing the skill
   // to be re-invoked every turn. It is spoken only if the user stays silent.
   // Pointless once the session is ending, so it is left off there.
+  //
+  // Built here rather than passed in, so every mic-open reply narrates whatever
+  // is running without each call site having to remember to ask.
   if (!shouldEndSession) {
-    response.reprompt = {
-      outputSpeech: {
-        type: "PlainText",
-        text: REPROMPT_TEXT,
-      },
-    };
+    const reprompt = sessionKey ? repromptFor(sessionKey) : IDLE_REPROMPT;
+
+    log(`[RPT ] "${reprompt}"`);
+
+    response.reprompt = { outputSpeech: speech(forSpeech(reprompt)) };
   }
 
   return {
@@ -204,13 +265,13 @@ const extractUserQuery = (req) => {
 // Races the tool against the deadline. If the deadline wins, the SAME promise
 // keeps running and is handed to the job registry - nothing is cancelled or
 // restarted, so the work is never done twice.
-const runToolOrBackground = async (toolCall, sessionKey, { confirmed = false } = {}) => {
+const runToolOrBackground = async (toolCall, sessionKey) => {
   const name = toolCall.function?.name;
   const args = parseToolArgs(toolCall) ?? {};
 
   // Reading job state must stay instant, or "is it done?" would itself queue.
   if (!isBackgroundable(name)) {
-    return { mode: "inline", result: await runTool(toolCall, { sessionKey, confirmed }) };
+    return { mode: "inline", result: await runTool(toolCall, { sessionKey }) };
   }
 
   // Started with the long timeout up front: if this becomes a job it must
@@ -218,7 +279,6 @@ const runToolOrBackground = async (toolCall, sessionKey, { confirmed = false } =
   const startedAt = Date.now();
   const promise = runTool(toolCall, {
     sessionKey,
-    confirmed,
     timeoutMs: BACKGROUND_TIMEOUT_MS,
   });
 
@@ -239,6 +299,7 @@ const runToolOrBackground = async (toolCall, sessionKey, { confirmed = false } =
   const job = registerJob({
     sessionKey,
     label: describeToolCall(name, args),
+    narration: narrateToolCall(name, args),
     promise,
     startedAt,
   });
@@ -263,37 +324,8 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
     addAssistantMessage(chatMemory, message);
 
     let backgrounded = false;
-    let gated = null;
 
     for (const toolCall of message.tool_calls) {
-      // Every tool call in this message still needs a result appended, gated
-      // or not - the API rejects an assistant turn whose tool_calls are left
-      // unanswered.
-      if (gated) {
-        addToolResult(chatMemory, toolCall.id, {
-          ok: false,
-          error: "Not run - an earlier step is waiting on the user's confirmation.",
-        });
-
-        continue;
-      }
-
-      const confirmation = confirmationFor(toolCall);
-
-      // Held, not executed. Nothing after it runs either: the user may still
-      // say no, and what follows was planned assuming this one succeeded.
-      if (confirmation) {
-        gated = confirmation;
-
-        addToolResult(chatMemory, toolCall.id, {
-          ok: false,
-          status: "awaiting_confirmation",
-          note: `Not executed. The user is being asked to confirm "${confirmation.command}" out loud.`,
-        });
-
-        continue;
-      }
-
       const outcome = await runToolOrBackground(toolCall, sessionKey);
 
       if (outcome.mode === "background") {
@@ -310,28 +342,16 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
       }
     }
 
-    // Asking takes priority over anything else this round: the gate is the
-    // whole point, and the reply names the command so the user knows what
-    // they are agreeing to.
-    if (gated) {
-      logWarn(`[GATE] holding "${gated.command}" for confirmation`);
-
-      return {
-        role: "assistant",
-        content: gated.prompt ?? `That will run ${gated.command}. Say yes to confirm.`,
-        pendingAction: gated,
-      };
-    }
-
     // Something went to the background. Answering now costs one fewer LLM
     // call, which matters because the deadline already spent most of the
-    // budget - so this reply is canned rather than generated.
+    // budget - so this reply is canned rather than generated. The reprompt
+    // narrates the job from here, so this stays short.
     if (backgrounded) {
       log("[LOOP] backgrounded work - replying early without another LLM call");
 
       return {
         role: "assistant",
-        content: "I've started that. Ask me for a status update in a bit.",
+        content: "On it. That's running now.",
       };
     }
 
@@ -353,31 +373,7 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
   return message;
 };
 
-// A confirmed command answers without a second LLM call. The deadline has
-// usually eaten most of Alexa's budget by this point, and there is nothing to
-// decide - the command either ran or it did not.
-const describeOutcome = (command, outcome) => {
-  if (outcome.mode === "background") {
-    return "That's running now. Ask me for a status update in a bit.";
-  }
-
-  if (outcome.result?.ok === false) {
-    return `That didn't work. ${outcome.result.error ?? ""}`.trim();
-  }
-
-  const output = outcome.result?.output;
-
-  return output ? `Done. ${output}` : `Done. ${command} finished.`;
-};
-
-const outcomeForModel = (outcome) =>
-  JSON.stringify(
-    outcome.mode === "background"
-      ? { status: "running", job_id: outcome.job.id }
-      : outcome.result,
-  ).slice(0, 600);
-
-// Finished work the user was never told about, injected so Jarvis can mention
+// Finished work the user was never told about, injected so Pluto can mention
 // it unprompted instead of waiting to be asked.
 const injectFinishedJobs = (chatMemory, sessionKey) => {
   const finished = takeUnreportedJobs(sessionKey);
@@ -412,10 +408,12 @@ router.post("/alexa", async (req, res) => {
     }
 
     if (requestType === "LaunchRequest") {
-      log(`[TURN] LaunchRequest session=${sessionKey}`);
+      const greeting = greetingFor(new Date().getHours());
+
+      log(`[TURN] LaunchRequest session=${sessionKey} greeting="${greeting}"`);
 
       return res.json(
-        buildAlexaResponse("Pluto is activated! How can I assist you?", false),
+        buildAlexaResponse(`${greeting} How can I assist you?`, false, sessionKey),
       );
     }
 
@@ -434,7 +432,7 @@ router.post("/alexa", async (req, res) => {
     if (intentName === "AMAZON.HelpIntent") {
       log(`[TURN] AMAZON.HelpIntent session=${sessionKey}`);
 
-      return res.json(buildAlexaResponse(HELP_TEXT, false));
+      return res.json(buildAlexaResponse(HELP_TEXT, false, sessionKey));
     }
 
     const userQuery = extractUserQuery(req);
@@ -460,6 +458,7 @@ router.post("/alexa", async (req, res) => {
             ? "Sorry, I missed that. Could you say it again?"
             : "I missed that. Try saying Pluto, followed by your command.",
           false,
+          sessionKey,
         ),
       );
     }
@@ -490,45 +489,6 @@ router.post("/alexa", async (req, res) => {
     // Something was understood, so the run of failures is over.
     session.fallbackStreak = 0;
 
-    // A pending command is answered on the very next turn or not at all, and
-    // it is consumed either way: anything other than a plain yes drops it and
-    // is then handled as an ordinary turn.
-    if (session.pendingAction) {
-      const pending = session.pendingAction;
-      session.pendingAction = null;
-
-      if (CONFIRMATIONS.has(normalized)) {
-        log(`[GATE] confirmed "${pending.command}" session=${sessionKey}`);
-        addUserMessage(chatMemory, userQuery);
-
-        const outcome = await runToolOrBackground(pending.toolCall, sessionKey, {
-          confirmed: true,
-        });
-
-        const spoken = describeOutcome(pending.command, outcome);
-
-        // Recorded as a note rather than a tool result: the assistant turn
-        // that asked for this command was answered last turn, so there is no
-        // open tool call left for a result to attach to.
-        addSystemNote(
-          chatMemory,
-          `The user confirmed "${pending.command}" and it was run. Outcome: ${outcomeForModel(outcome)}`,
-        );
-        addAssistantMessage(chatMemory, spoken);
-        trimHistory(chatMemory, 20);
-
-        log(`[TURN] complete in ${turnTimer()}ms (confirmed action)`, `jobs=${jobCount()}`);
-
-        return res.json(buildAlexaResponse(spoken, false));
-      }
-
-      logWarn(`[GATE] not confirmed - dropping "${pending.command}" session=${sessionKey}`);
-      addSystemNote(
-        chatMemory,
-        `The user did not confirm "${pending.command}", so it was not run. Do not run it unless they ask again.`,
-      );
-    }
-
     const lower = userQuery.toLowerCase();
 
     if (
@@ -548,10 +508,6 @@ router.post("/alexa", async (req, res) => {
 
     const message = await runConversationTurn(chatMemory, sessionKey);
 
-    if (message.pendingAction) {
-      session.pendingAction = message.pendingAction;
-    }
-
     addAssistantMessage(chatMemory, message);
     trimHistory(chatMemory, 20);
 
@@ -561,12 +517,12 @@ router.post("/alexa", async (req, res) => {
       `jobs=${jobCount()}`,
     );
 
-    return res.json(buildAlexaResponse(message.content, false));
+    return res.json(buildAlexaResponse(message.content, false, sessionKey));
   } catch (error) {
     logError(`[TURN] failed after ${turnTimer()}ms session=${sessionKey}`);
     logError(error?.stack || error);
 
-    return res.json(buildAlexaResponse("Something went wrong", false));
+    return res.json(buildAlexaResponse("Something went wrong", false, sessionKey));
   }
 });
 

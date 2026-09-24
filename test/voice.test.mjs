@@ -1,6 +1,11 @@
-// Covers the confirmation gate end to end: the real Express app, the real
-// tool registry and a real executor.py subprocess. Only the model is faked,
-// so the scripted tool calls stand in for whatever Groq would have asked for.
+// The voice path end to end: the real Express app, the real tool registry and a
+// real executor.py subprocess. Only the model is faked, so the scripted tool
+// calls stand in for whatever Groq would have asked for.
+//
+// There is no confirmation step any more. Several tests here exist to hold that
+// line from the other side - asserting that nothing asks the user to say yes -
+// while the rules that did survive (no chaining, nothing outside the workspace)
+// are asserted to still refuse.
 //
 //   npm test
 //
@@ -119,46 +124,48 @@ after(() => {
   }
 });
 
-const say = async (sessionId, text) => {
-  const res = await fetch(base, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session: { sessionId },
-      request: { type: "IntentRequest", intent: { slots: { q: { value: text } } } },
-    }),
-  });
-
-  const body = await res.json();
+// Responses are SSML now, so the spoken words have to be unwrapped before they
+// can be compared to anything. `ssml` keeps the raw document for the cases that
+// care about the markup itself.
+const spokenFrom = (body) => {
+  const ssml = body.response.outputSpeech.ssml ?? "";
 
   return {
-    text: body.response.outputSpeech.text,
+    type: body.response.outputSpeech.type,
+    ssml,
+    text: ssml
+      .replace(/^<speak>/, "")
+      .replace(/<\/speak>$/, "")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .trim(),
+    reprompt: body.response.reprompt?.outputSpeech?.ssml ?? null,
     end: body.response.shouldEndSession,
   };
 };
+
+const post = async (sessionId, request) => {
+  const res = await fetch(base, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { sessionId }, request }),
+  });
+
+  return spokenFrom(await res.json());
+};
+
+const say = (sessionId, text) =>
+  post(sessionId, { type: "IntentRequest", intent: { slots: { q: { value: text } } } });
 
 // Built-in intents carry a name and no slots, which is exactly the shape that
 // used to fall through to the "say tell me" message.
-const sayIntent = async (sessionId, intentName, slots) => {
-  const res = await fetch(base, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session: { sessionId },
-      request: {
-        type: "IntentRequest",
-        intent: { name: intentName, ...(slots ? { slots } : {}) },
-      },
-    }),
+const sayIntent = (sessionId, intentName, slots) =>
+  post(sessionId, {
+    type: "IntentRequest",
+    intent: { name: intentName, ...(slots ? { slots } : {}) },
   });
-
-  const body = await res.json();
-
-  return {
-    text: body.response.outputSpeech.text,
-    end: body.response.shouldEndSession,
-  };
-};
 
 const toolCall = (name, args) => ({
   role: "assistant",
@@ -182,75 +189,65 @@ test("a command that merely contains an exit word does not", async () => {
   assert.equal(r.text, "Closing it now.");
 });
 
-// --- the confirmation gate ------------------------------------------------
+// --- autonomy: nothing waits for a spoken yes -----------------------------
 
-test("a mutating command is gated, not executed", async () => {
-  scripted.push(shell("git commit -m wip"));
+test("a command that changes the repo runs without being confirmed", async () => {
+  scripted.push(shell("git status --short"));
+  scripted.push({ role: "assistant", content: "Committed." });
   const r = await say("s1", "commit my work");
-  assert.equal(r.text, "That will run git commit -m wip. Say yes to confirm.");
+
+  // The old behaviour was to hold this and read it back. Nothing does now.
+  assert.doesNotMatch(r.text, /say yes|confirm/i);
+  assert.equal(r.text, "Committed.");
   assert.equal(r.end, false);
 });
 
-test("yes releases the held command", async () => {
-  const r = await say("s1", "yes");
-  assert.doesNotMatch(r.text, /not on the allowed list/);
-  assert.match(r.text, /Done\.|didn't work|running now/);
+test("no reply ever asks the user to confirm a command", async () => {
+  scripted.push(shell("npm run build"));
+  scripted.push({ role: "assistant", content: "Building now." });
+  const r = await say("s2", "build it");
+
+  assert.doesNotMatch(r.text, /say yes|shall i|would you like|confirm/i);
 });
 
-test("the gate does not stay armed once it has fired", async () => {
-  scripted.push({ role: "assistant", content: "Anything else?" });
-  const r = await say("s1", "yes");
-  assert.equal(r.text, "Anything else?");
-});
-
-test("anything other than yes aborts and is handled as a normal turn", async () => {
-  scripted.push(shell("npm install left-pad"));
-  const gated = await say("s2", "install left pad");
-  assert.match(gated.text, /Say yes to confirm/);
-
-  scripted.push({ role: "assistant", content: "Okay, skipped." });
-  const aborted = await say("s2", "actually tell me a joke");
-  assert.equal(aborted.text, "Okay, skipped.");
-});
-
-test("a chained command is refused outright, never offered for confirmation", async () => {
+test("a chained command is still refused outright", async () => {
   scripted.push(shell("git status && rm -rf ."));
   scripted.push({ role: "assistant", content: "I can't run that." });
   const r = await say("s3", "run something sneaky");
   assert.equal(r.text, "I can't run that.");
 });
 
-// --- the read-only fast track --------------------------------------------
-
-test("an allowlisted read-only command skips the gate despite matching a prefix", async () => {
+test("a read-only command still answers inline", async () => {
   scripted.push(shell("git status"));
   scripted.push({ role: "assistant", content: "You have four modified files." });
   const r = await say("s4", "what's my git status");
   assert.equal(r.text, "You have four modified files.");
 });
 
-test("a non-allowlisted command with the same prefix is still gated", async () => {
-  scripted.push(shell("git push"));
-  const r = await say("s5", "push my work");
-  assert.match(r.text, /Say yes to confirm/);
-});
-
 // --- the dedicated Claude tool -------------------------------------------
 
-test("a Claude run is gated and reads the prompt back", async () => {
+test("a Claude run starts immediately instead of reading the prompt back", async () => {
   scripted.push(toolCall("run_claude", { prompt: "build a landing page" }));
+  scripted.push({ role: "assistant", content: "Building the landing page now." });
   const r = await say("c1", "build me a landing page");
-  assert.equal(r.text, "That will run Claude with: build a landing page. Say yes to confirm.");
+
+  assert.doesNotMatch(r.text, /say yes|confirm/i);
+
+  // The stand-in is node -p, so the prompt is not valid input and comes back a
+  // failure. That it ran at all is the point: no refusal, and no question.
+  assert.doesNotMatch(r.text, /not on the allowed list|not confirmed/);
 });
 
-test("a confirmed Claude run is released to the CLI", async () => {
-  const r = await say("c1", "do it");
+test("the Claude handler no longer refuses an unconfirmed call", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
+  const result = await runTool(
+    { function: { name: "run_claude", arguments: JSON.stringify({ prompt: "1+1" }) } },
+    { sessionKey: "direct" },
+  );
 
-  // The stand-in is node -p, so "build a landing page" is not valid input and
-  // comes back as a failure. That it ran at all is the point: what must never
-  // appear here is a refusal.
-  assert.doesNotMatch(r.text, /not on the allowed list|not confirmed/);
-  assert.match(r.text, /Done\.|didn't work|running now/);
+  // It may fail for its own reasons - the stand-in, the workspace - but never
+  // because nobody said yes.
+  assert.doesNotMatch(String(result.error ?? ""), /not confirmed/);
 });
 
 test("shell metacharacters survive the trip to the CLI", async () => {
@@ -286,17 +283,6 @@ test("shell metacharacters survive the trip to the CLI", async () => {
   }
 
   throw new Error("stand-in CLI never finished");
-});
-
-test("an unconfirmed Claude run is refused by the handler too", async () => {
-  const { runTool } = await import("../src/tools/registry.js");
-  const result = await runTool(
-    { function: { name: "run_claude", arguments: JSON.stringify({ prompt: "delete everything" }) } },
-    { sessionKey: "direct" },
-  );
-
-  assert.equal(result.ok, false);
-  assert.match(result.error, /not confirmed/);
 });
 
 // --- the VS Code project workflow ----------------------------------------
@@ -366,31 +352,25 @@ test("open_project opens an existing folder with no confirmation", async () => {
   assert.equal(r.text, "Landing page is open.");
 });
 
-test("init_project asks its own question rather than the default wording", async () => {
+test("a missing project is created and initialised without being asked about", async () => {
   scripted.push(toolCall("init_project", { project: "invoice tracker" }));
+  scripted.push({ role: "assistant", content: "Setting up invoice tracker now." });
   const r = await say("v2", "invoice tracker");
 
-  assert.equal(r.text, "That project isn't present. Should I initialize a new repo?");
+  assert.doesNotMatch(r.text, /should i|say yes/i);
+  assert.ok(fs.existsSync(path.join(workspace, "invoice-tracker", ".git")));
   assert.equal(r.end, false);
 });
 
-test("confirming creates the folder, the repo and opens it", async () => {
-  const r = await say("v2", "yes");
-
-  assert.doesNotMatch(r.text, /not confirmed|didn't work/);
-  assert.ok(fs.existsSync(path.join(workspace, "invoice-tracker", ".git")));
-});
-
-test("an unconfirmed init is refused by the handler too", async () => {
+test("the init handler no longer refuses an unconfirmed call", async () => {
   const { runTool } = await import("../src/tools/registry.js");
   const result = await runTool(
-    { function: { name: "init_project", arguments: JSON.stringify({ project: "sneaky" }) } },
+    { function: { name: "init_project", arguments: JSON.stringify({ project: "straight through" }) } },
     {},
   );
 
-  assert.equal(result.ok, false);
-  assert.match(result.error, /not confirmed/);
-  assert.ok(!fs.existsSync(path.join(workspace, "sneaky")));
+  assert.equal(result.ok, true);
+  assert.ok(fs.existsSync(path.join(workspace, "straight-through", ".git")));
 });
 
 // --- utterances that carry no query --------------------------------------
@@ -477,14 +457,10 @@ test("a carrier phrase does not stop an exit phrase matching", async () => {
   assert.equal(r.end, true);
 });
 
-test("a carrier phrase does not stop a confirmation matching", async () => {
-  scripted.push(toolCall("init_project", { project: "carrier test" }));
-  const gated = await say("b7", "carrier test");
-  assert.match(gated.text, /Should I initialize a new repo/);
+test("a carrier phrase does not stop the invocation name ending the session", async () => {
+  const r = await sayIntent("b7", "AskIntent", { query: { name: "query", value: "Pluto, stop" } });
 
-  const r = await sayIntent("b7", "AskIntent", { query: { name: "query", value: "jarvis yes" } });
-  assert.doesNotMatch(r.text, /not confirmed/);
-  assert.ok(fs.existsSync(path.join(workspace, "carrier-test", ".git")));
+  assert.equal(r.end, true);
 });
 
 test("a carrier phrase on a real question is still passed to the model", async () => {
@@ -497,16 +473,17 @@ test("a carrier phrase on a real question is still passed to the model", async (
 
 // --- the autonomy instruction --------------------------------------------
 
-test("the appended instruction is never read back to the user", async () => {
+test("the appended instruction is never spoken to the user", async () => {
   const { AUTONOMOUS_SUFFIX } = await import("../src/data/chatMemory.js");
 
   scripted.push(toolCall("run_claude", { prompt: `build a landing page
 
 ${AUTONOMOUS_SUFFIX}` }));
+  scripted.push({ role: "assistant", content: "Building it now." });
   const r = await say("a1", "build me a landing page");
 
-  assert.equal(r.text, "That will run Claude with: build a landing page. Say yes to confirm.");
   assert.doesNotMatch(r.text, /autonomous developer/);
+  assert.doesNotMatch(r.reprompt ?? "", /autonomous developer/);
 });
 
 test("the system prompt carries the rule and the exact wording", async () => {
@@ -516,13 +493,19 @@ test("the system prompt carries the rule and the exact wording", async () => {
   assert.ok(SYSTEM_PROMPT.includes(AUTONOMOUS_SUFFIX));
 });
 
+test("the system prompt tells the model to act rather than ask", async () => {
+  const { SYSTEM_PROMPT } = await import("../src/data/chatMemory.js");
+
+  assert.match(SYSTEM_PROMPT, /do not ask for permission/i);
+  assert.match(SYSTEM_PROMPT, /interjection/);
+  assert.match(SYSTEM_PROMPT, /Pluto/);
+});
+
 // --- reading a file ------------------------------------------------------
 
-test("type is on the allowlist and runs without confirmation", async () => {
-  const { confirmationFor, runTool } = await import("../src/tools/registry.js");
+test("type is on the allowlist and reads a workspace file", async () => {
+  const { runTool } = await import("../src/tools/registry.js");
   const call = { function: { name: "run_command", arguments: JSON.stringify({ command: "type notes.txt" }) } };
-
-  assert.equal(confirmationFor(call), null, "reading a file must not be gated");
 
   const result = await runTool(call, {});
 
@@ -613,13 +596,12 @@ test("a traversal out of the workspace is refused", async () => {
   assert.match(result.error, /outside the project workspace/);
 });
 
-test("an escaping command is refused outright, never offered for confirmation", async () => {
+test("an escaping command is refused even though nothing is gated any more", async () => {
   scripted.push(toolCall("run_command", { command: "git add C:/projects/jarvis/jarvis/.env" }));
   scripted.push({ role: "assistant", content: "I can't reach that." });
   const r = await say("cf1", "stage that file");
 
   assert.equal(r.text, "I can't reach that.");
-  assert.doesNotMatch(r.text, /Say yes/);
 });
 
 test("the executor refuses it too, with no Node allowlist in the path", async () => {
@@ -665,4 +647,88 @@ test("pluto in front of a real question still reaches the model", async () => {
 
   assert.equal(r.end, false);
   assert.equal(r.text, "It is Wednesday.");
+});
+
+// --- what every response carries -----------------------------------------
+
+test("responses are SSML, not PlainText", async () => {
+  scripted.push({ role: "assistant", content: "Sure thing." });
+  const r = await say("ssml1", "hello");
+
+  // PlainText would have read any interjection out as words.
+  assert.equal(r.type, "SSML");
+  assert.ok(r.ssml.startsWith("<speak>"), r.ssml);
+});
+
+test("an interjection from the model reaches Alexa as markup", async () => {
+  scripted.push({
+    role: "assistant",
+    content: '<say-as interpret-as="interjection">got it</say-as> starting the server.',
+  });
+  const r = await say("ssml2", "run my project");
+
+  assert.match(r.ssml, /<say-as interpret-as="interjection">got it<\/say-as>/);
+});
+
+test("tool output with an ampersand does not produce an invalid document", async () => {
+  scripted.push({ role: "assistant", content: "I ran lint && test, both passed." });
+  const r = await say("ssml3", "how did it go");
+
+  assert.ok(!/&(?!amp;|lt;|gt;)/.test(r.ssml), r.ssml);
+});
+
+test("every mic-open response carries a reprompt", async () => {
+  scripted.push({ role: "assistant", content: "Still here." });
+
+  const answers = [
+    await say("rp1", "anything"),
+    await sayIntent("rp2", "AMAZON.HelpIntent"),
+    await sayIntent("rp3", "AMAZON.FallbackIntent"),
+    await post("rp4", { type: "LaunchRequest" }),
+  ];
+
+  for (const answer of answers) {
+    assert.equal(answer.end, false);
+    assert.ok(answer.reprompt, `no reprompt on ${answer.text}`);
+    assert.ok(answer.reprompt.startsWith("<speak>"), answer.reprompt);
+  }
+});
+
+test("a response that ends the session carries no reprompt", async () => {
+  const r = await sayIntent("rp5", "AMAZON.StopIntent");
+
+  assert.equal(r.end, true);
+  assert.equal(r.reprompt, null);
+});
+
+test("the launch greeting is time-aware and names Pluto", async () => {
+  const r = await post("rp6", { type: "LaunchRequest" });
+
+  assert.match(r.text, /Good morning|Good afternoon|Good evening|Working late/);
+  assert.match(r.text, /Pluto is here/);
+  assert.equal(r.end, false);
+});
+
+test("the reprompt narrates a job running in that session", async () => {
+  const { clearSessionJobs, registerJob } = await import("../src/data/jobRegistry.js");
+
+  clearSessionJobs("rp7");
+  registerJob({
+    sessionKey: "rp7",
+    label: "ask Claude to build a landing page",
+    narration: "Claude is currently building a landing page",
+    promise: new Promise(() => {}),
+  });
+
+  scripted.push({ role: "assistant", content: "Anything else?" });
+  const busy = await say("rp7", "how's it going");
+
+  assert.match(busy.reprompt, /Claude is currently building a landing page/);
+
+  // ...and a session with nothing running gets the plain invitation instead.
+  scripted.push({ role: "assistant", content: "Anything else?" });
+  const idle = await say("rp8", "how's it going");
+
+  assert.match(idle.reprompt, /let me know what to do next/i);
+  clearSessionJobs("rp7");
 });
