@@ -32,7 +32,12 @@ Opening VS Code is a multi-turn workflow. Follow it exactly, one step per turn:
 
 If check_directory reports a name close to what you heard, say which projects exist and ask which one they meant rather than creating a second folder beside it.
 
-To run a project, work out what it is built with before reaching for a command: look for package.json with run_command "type package.json" and use "npm start" or the script it names, or for a python project run "python" against its entry point. Then open it with "start http://localhost:3000", or whichever port the output reported. A server does not finish, so say it is running rather than waiting for it, and never claim a port you have not seen.
+When the user asks to run a project, or to see the UI, do it in one call:
+1. Work out what it is built with first. Read package.json with run_command "type package.json" and use the script it names - "npm run dev" for vite, "npm start" for create-react-app - or for a python project run "python" against its entry point.
+2. Call run_command with that command, cwd set to the project, and open_browser true. The page is opened for you at whatever address the server reported, so do not call "start" yourself and do not try to work out the port. Pass port as well if package.json made it obvious, as a fallback for a server that prints nothing.
+3. The reply comes back with started true while the server keeps running. Say it is up and that you have opened it. Never wait for a server to finish, and never read a port aloud that you have not seen in the result.
+
+If the result says the browser was not opened, say so plainly and ask which port the user expects rather than guessing one.
 
 Once a project is open or named, pass its name as the cwd argument to run_command and run_claude every time. Without it the files are written to the workspace root instead of into the project, which is almost never what the user meant.
 

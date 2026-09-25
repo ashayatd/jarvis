@@ -5,7 +5,7 @@ import {
   INLINE_TIMEOUT_MS,
   REMOTE_JOB_TIMEOUT_MS,
 } from "../services/executorService.js";
-import { log, logError, preview, startTimer } from "../utils/logger.js";
+import { log, logError, logWarn, preview, startTimer } from "../utils/logger.js";
 
 // Spoken app names -> the command your PC agent actually receives. None of
 // these have handlers on the agent yet; they need adding there before they
@@ -59,14 +59,35 @@ const ALLOWED_PREFIXES = [
   "npm",
 ];
 
+// Servers. These never exit, so there is nothing to wait for and polling one to
+// completion is a category error: the poll runs until it gives up, the executor
+// kills the process at its job timeout, and the user is told their dev server
+// timed out. They are spawned, checked once to see they did not fall over, and
+// then left alone.
+//
+// "node" and "python" are here because that is how a server is usually started,
+// but they are also how a one-off script is started. That is fine: a script
+// exits inside the confirmation window and is reported as the finished command
+// it is, so the misclassification corrects itself.
+const DAEMON_PREFIXES = [
+  "npm start",
+  "npm run dev",
+  "npm run start",
+  "npm run serve",
+  "npm run preview",
+  "npm run watch",
+  "node",
+  "python",
+];
+
 // Commands that finish in a moment and can be answered inline. Everything else
 // allowed is treated as long-running and sent down the job path instead,
 // because inline means the executor's 15 second ceiling - which would kill a
-// dev server just as it finished booting and report it as a timeout.
+// slow install just as it got going and report it as a timeout.
 //
 // Stated as the short list rather than the long one so a new entry above is
 // slow by default: waiting a little too long for an answer is a much smaller
-// problem than a killed server reported as a failure.
+// problem than work killed halfway and reported as a failure.
 const INSTANT_PREFIXES = [
   "git status",
   "git log",
@@ -128,7 +149,16 @@ export const escapesWorkspace = (command) =>
 // directly rather than only through whatever a tool does with the answer.
 export const isAllowed = (command) => matchesPrefix(command, ALLOWED_PREFIXES);
 
-export const isLongRunning = (command) => !matchesPrefix(command, INSTANT_PREFIXES);
+// Checked before the daemon list, so "node -v" answers instead of being spawned
+// and watched.
+export const isInstant = (command) => matchesPrefix(command, INSTANT_PREFIXES);
+
+export const isDaemon = (command) =>
+  !isInstant(command) && matchesPrefix(command, DAEMON_PREFIXES);
+
+// Slow but finite: npm install, npx create-react-app, git clone. Worth polling,
+// because there is an end to poll for.
+export const isLongRunning = (command) => !isInstant(command) && !isDaemon(command);
 
 // What to say while a job is still running, so the reprompt can narrate the
 // work instead of repeating one line. Lives on the tool next to `describe` for
@@ -153,6 +183,44 @@ ${AUTONOMOUS_SUFFIX}`;
 // ...and the inverse, for anything the user hears. Reading the suffix aloud
 // would make every confirmation a paragraph long.
 const withoutAutonomy = (prompt) => prompt.replace(AUTONOMOUS_SUFFIX, "").trim();
+
+// Opens the page a dev server just started serving, when asked to.
+//
+// The address the server printed is preferred over anything the model guessed:
+// a vite project moved to port 5174 because 5173 was taken will say so, and
+// opening the port from package.json would show the wrong app or nothing. The
+// guess is only a fallback, and if there is neither then nothing is opened and
+// the result says why - a browser pointed at a dead port is worse than none.
+const openIfAsked = async ({ openBrowser, port, url, timeoutMs }) => {
+  if (openBrowser !== true) {
+    return url ? { url } : {};
+  }
+
+  const target =
+    url ?? (Number.isInteger(port) && port > 0 ? `http://localhost:${port}` : null);
+
+  if (!target) {
+    logWarn("[TOOL] open_browser asked for but no address known - not guessing");
+
+    return {
+      browser: "not opened",
+      note: "The server did not report an address and no port was given, so nothing was opened. Ask the user which port, or read it from package.json.",
+    };
+  }
+
+  try {
+    await execute("run_command", { command: `start ${target}` }, { timeoutMs });
+
+    log(`[TOOL] opened ${target}`);
+
+    return { url: target, browser: "opened" };
+  } catch (error) {
+    // The server is up either way, which is the more important half.
+    logError(`[TOOL] could not open ${target}: ${error.message}`);
+
+    return { url: target, browser: "not opened", note: `Could not open the browser: ${error.message}` };
+  }
+};
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -251,13 +319,13 @@ const TOOLS = {
       function: {
         name: "run_command",
         description:
-          `Run a command on the user's PC and return its output. Anything starting with one of these runs straight away: ${ALLOWED_PREFIXES.join(", ")}, and "start <url>" to open a page in the browser. Use them to start a project however it is built - "npm start" or "npm run dev" for node, "python app.py" for python - and "start http://localhost:3000" to open it in the browser. Pass cwd so it runs in the project rather than the workspace root. A server keeps running in the background, so say it has started rather than waiting for it to finish. Commands starting with ${MUTATING_PREFIXES.map((prefix) => prefix.trim()).join(", ")} are allowed too, but the user is asked to confirm those out loud first - call the tool as normal and the confirmation is handled for you. Do not use this for coding or file edits - that is what run_claude is for. Nothing else is permitted, commands may not be chained, and every path must be relative to the workspace.`,
+          `Run a command on the user's PC and return its output. Anything starting with one of these is allowed: ${ALLOWED_PREFIXES.join(", ")}. Start a project however it is built - "npm start" or "npm run dev" for node, "python app.py" for python - and pass open_browser true in the same call to have the page opened once it is up. A server does not finish: the reply comes back with started true and the work carries on, so say it is running rather than waiting for it. Always pass cwd for anything belonging to a project, or the command runs in the workspace root and finds no package.json. Do not use this for coding or file edits - that is what run_claude is for. Nothing else is permitted, commands may not be chained, and every path must be relative to the workspace.`,
         parameters: {
           type: "object",
           properties: {
             command: {
               type: "string",
-              description: "The command line to run, e.g. 'git status' or 'npm start'.",
+              description: "The command line to run, e.g. 'git status' or 'npm run dev'.",
             },
             cwd: {
               // Must accept null: the model sends cwd=null when omitting it,
@@ -267,12 +335,22 @@ const TOOLS = {
               description:
                 "Optional project folder to run in, e.g. 'landing page'. Pass this whenever the command belongs to a project - 'npm start' in the workspace root will not find the project's package.json. Omit or pass null for a command about the machine itself.",
             },
+            open_browser: {
+              type: ["boolean", "null"],
+              description:
+                "Pass true when starting a dev server the user wants to see. The page is opened at whatever address the server reported, so you do not need to know the port or call 'start' yourself. Ignored for commands that are not servers.",
+            },
+            port: {
+              type: ["integer", "null"],
+              description:
+                "Only useful with open_browser, and only as a fallback: if the server prints its address, that is used instead. Pass the port you expect from package.json - 5173 for vite, 3000 for create-react-app or next.",
+            },
           },
           required: ["command"],
         },
       },
     },
-    handler: async ({ command, cwd }, { timeoutMs }) => {
+    handler: async ({ command, cwd, open_browser: openBrowser, port }, { timeoutMs }) => {
       if (!command) {
         return { ok: false, error: "No command given." };
       }
@@ -313,10 +391,39 @@ const TOOLS = {
       const args = { command, ...(folder ? { cwd: folder } : {}) };
       const label = folder ? `${command} (in ${folder})` : command;
 
-      // Inline only when it will actually finish. A dev server would hit the
-      // executor's 15 second ceiling and be killed, so anything not on the
-      // instant list goes down the job path - the spoken reply then says it
-      // started rather than waiting for an end that is not coming.
+      // Three shapes of command, and getting this wrong is what made starting a
+      // dev server look broken. A server is spawned and confirmed, never polled
+      // to an exit that is not coming. Slow-but-finite work is polled, because
+      // there is an end to poll for. Everything else answers inline.
+      if (isDaemon(command)) {
+        const started = await execute("start_daemon", args, { timeoutMs });
+
+        if (started?.ok === false) {
+          return started;
+        }
+
+        // It exited inside the confirmation window, so it was a script rather
+        // than a server. Fall through to the ordinary reporting below.
+        if (started?.started !== true) {
+          return {
+            ok: true,
+            command,
+            ...(folder ? { cwd: folder } : {}),
+            output: String(started?.output ?? "").slice(0, 800),
+          };
+        }
+
+        return {
+          ok: true,
+          status: "running",
+          started: true,
+          message: "Dev server is running in background",
+          command,
+          ...(folder ? { cwd: folder } : {}),
+          ...(await openIfAsked({ openBrowser, port, url: started?.url, timeoutMs })),
+        };
+      }
+
       const result = isLongRunning(command)
         ? await runRemoteJob("start_command", args, label)
         : await execute("run_command", args, { timeoutMs });

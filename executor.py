@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -86,8 +87,23 @@ JOB_TTL_S = 30 * 60
 # Output is fed to an LLM and then spoken aloud, so the tail is what matters.
 MAX_OUTPUT_CHARS = 4000
 
+# How long to give a spawned server before deciding it survived. Long enough
+# for a bad command, a missing script or a port clash to exit and be reported
+# as the failure it is; short enough to stay inside Alexa's turn.
+DAEMON_CONFIRM_S = float(os.environ.get("EXECUTOR_DAEMON_CONFIRM", "1.5"))
+
 _jobs = {}
 _jobs_lock = threading.Lock()
+
+# Popen handles for the servers still up, kept so they are not garbage
+# collected and so their status can be re-read later. Deliberately never
+# waited on: a dev server does not exit, and waiting is the bug being fixed.
+_daemons = {}
+
+# Printed by every dev server worth opening: Vite's "Local: http://localhost:5173/",
+# CRA's "On Your Network", and so on. Read out of the first seconds of output so
+# the browser can be pointed at the real port rather than a guessed one.
+_LOCAL_URL = re.compile(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d{2,5})?/?\S*")
 
 
 # Spoken project names arrive as "landing page", while the folder on disk is
@@ -211,6 +227,130 @@ def _sweep_jobs():
 
     if expired:
         print(f"[EXEC] swept {len(expired)} expired job(s)")
+
+
+def _read_tail(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-MAX_OUTPUT_CHARS:].strip()
+    except OSError:
+        return ""
+
+
+def _detect_url(output):
+    """The address a dev server said it was listening on, if it said one."""
+    match = _LOCAL_URL.search(output or "")
+
+    if not match:
+        return None
+
+    url = match.group(0).rstrip(".,)")
+
+    # 0.0.0.0 is a bind address, not something a browser should be sent to.
+    return url.replace("0.0.0.0", "localhost")
+
+
+def _start_daemon(shell_command, cwd, label):
+    """Spawn a persistent process and report whether it survived its first
+    seconds.
+
+    Nothing here waits for the process to exit, because a dev server never
+    does. Output goes to a file rather than a pipe on purpose: nobody is
+    draining a pipe while the server runs, and a full pipe buffer would wedge
+    it. A file can be read at any moment and never blocks the child.
+    """
+    _sweep_jobs()
+
+    job_id = f"d{uuid.uuid4().hex[:8]}"
+    started = time.time()
+
+    log = tempfile.NamedTemporaryFile(
+        prefix=f"pluto-{job_id}-", suffix=".log", delete=False, mode="w", encoding="utf-8"
+    )
+
+    try:
+        proc = subprocess.Popen(
+            shell_command,
+            shell=True,
+            cwd=cwd or WORKDIR,
+            env=_child_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as error:
+        log.close()
+        print(f"[EXEC] {job_id} could not start: {error}")
+
+        return {"ok": False, "error": f"'{label}' could not be started: {error}"}
+
+    print(f"[EXEC] {job_id} spawned pid={proc.pid}: {label}")
+
+    # The one wait in this function, and it is a confirmation rather than a
+    # poll to completion: did it fall over straight away?
+    time.sleep(DAEMON_CONFIRM_S)
+
+    code = proc.poll()
+    log.flush()
+    output = _read_tail(log.name)
+    elapsed = round(time.time() - started, 1)
+
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "kind": "daemon",
+            "status": "running" if code is None else ("done" if code == 0 else "failed"),
+            "command": label,
+            "cwd": cwd or WORKDIR,
+            "pid": proc.pid,
+            "log": log.name,
+            "started_at": started,
+            "finished_at": None if code is None else time.time(),
+        }
+
+    # Exited before the confirmation window. A server doing that has failed, but
+    # a one-off script doing it has simply finished - the return code is what
+    # separates them, and both are reported as what they are rather than as
+    # "running in the background".
+    if code is not None:
+        log.close()
+        _daemons.pop(job_id, None)
+        print(f"[EXEC] {job_id} exited rc={code} after {elapsed}s")
+
+        if code == 0:
+            return {
+                "ok": True,
+                "status": "done",
+                "started": False,
+                "job_id": job_id,
+                "returncode": 0,
+                "output": output or "(no output)",
+            }
+
+        return {
+            "ok": False,
+            "status": "failed",
+            "started": False,
+            "job_id": job_id,
+            "returncode": code,
+            "error": f"'{label}' exited straight away with code {code}.",
+            "output": output or "(no output)",
+        }
+
+    _daemons[job_id] = proc
+    url = _detect_url(output)
+
+    print(f"[EXEC] {job_id} still up after {elapsed}s url={url or '(none seen)'}")
+
+    return {
+        "ok": True,
+        "status": "running",
+        "started": True,
+        "message": "Dev server is running in background",
+        "job_id": job_id,
+        "pid": proc.pid,
+        **({"url": url} if url else {}),
+        **({"output": output} if output else {}),
+    }
 
 
 def _finish(job_id, status, **fields):
@@ -394,6 +534,37 @@ def execute():
             "job_id": _start_job(shell_command, use_shell=True, label=label, cwd=job_cwd),
         })
 
+    # A dev server, which is not a job that finishes. start_command would have
+    # been polled to an exit that never comes and then killed at the job
+    # timeout; this spawns it, checks it survived, and leaves it alone.
+    if command == "start_daemon":
+        shell_command = data.get("args", {}).get("command", "")
+
+        if not shell_command:
+            return jsonify({"ok": False, "error": "No command provided."}), 400
+
+        if _escapes_workspace(shell_command):
+            print(f"[EXEC] REFUSED, leaves the workspace: {shell_command}")
+            return jsonify({
+                "ok": False,
+                "error": f"'{shell_command}' names a path outside the workspace.",
+            }), 400
+
+        job_cwd = _resolve_within_workspace(data.get("args", {}).get("cwd", ""))
+
+        if job_cwd is None or not os.path.isdir(job_cwd):
+            return jsonify({
+                "ok": False,
+                "error": f"'{data.get('args', {}).get('cwd')}' is not a project in the workspace.",
+            }), 400
+
+        where = os.path.relpath(job_cwd, os.path.abspath(WORKDIR))
+        label = shell_command if where == "." else f"{shell_command} (in {where})"
+
+        result = _start_daemon(shell_command, job_cwd, label)
+
+        return jsonify({**result, "cwd": job_cwd})
+
     # Deliberately instant and read-only: this is what lets the assistant ask
     # "which project?" and act on the answer inside one spoken turn.
     if command == "check_directory":
@@ -522,12 +693,33 @@ def execute():
     if command == "job_status":
         job_id = data.get("args", {}).get("job_id", "")
 
+        # A daemon's recorded status is only as fresh as the last time anyone
+        # looked, since nothing is waiting on it. Re-read the process before
+        # answering, or a server that died an hour ago still reports running.
+        daemon = _daemons.get(job_id)
+
+        if daemon is not None and daemon.poll() is not None:
+            _daemons.pop(job_id, None)
+            _finish(
+                job_id,
+                "done" if daemon.returncode == 0 else "failed",
+                returncode=daemon.returncode,
+                error=None if daemon.returncode == 0 else f"exited with code {daemon.returncode}",
+            )
+
         with _jobs_lock:
             job = _jobs.get(job_id)
             snapshot = dict(job) if job else None
 
         if snapshot is None:
             return jsonify({"ok": False, "error": f"Unknown job: {job_id}"}), 404
+
+        # Whatever it has printed since, for a server still up.
+        if snapshot.get("log"):
+            tail = _read_tail(snapshot["log"])
+
+            if tail:
+                snapshot["output"] = tail
 
         response = {
             "ok": snapshot["status"] != "failed",
