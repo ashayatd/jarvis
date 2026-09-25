@@ -9,10 +9,9 @@ import {
   trimHistory,
 } from "../data/chatMemory.js";
 import {
-  clearSessionJobs,
   describeJob,
+  getAllDaemons,
   getRunningJobs,
-  getSessionDaemons,
   jobCount,
   registerJob,
   takeUnreportedJobs,
@@ -90,9 +89,14 @@ const describeServers = (servers) => {
 // in flight: work being waited on, and servers that are simply up. Either is
 // more useful than a stock line - a reprompt is the only place the user hears
 // about them without having to ask.
-export const repromptFor = (sessionKey) => {
-  const running = getRunningJobs(sessionKey);
-  const servers = getSessionDaemons(sessionKey);
+//
+// Not scoped to the session. A long job now ends the session as it starts, so
+// by the time anyone hears a reprompt again it is a different conversation with
+// a different id - scoping this would have meant never mentioning the very work
+// the user re-opened the skill to ask about.
+export const repromptFor = () => {
+  const running = getRunningJobs();
+  const servers = getAllDaemons();
 
   if (!running.length) {
     return servers.length
@@ -374,14 +378,20 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
 
     // Something went to the background. Answering now costs one fewer LLM
     // call, which matters because the deadline already spent most of the
-    // budget - so this reply is canned rather than generated. The reprompt
-    // narrates the job from here, so this stays short.
+    // budget - so this reply is canned rather than generated.
+    //
+    // And the session closes with it. There is nothing to say for the minutes
+    // this will take, so holding the mic open only leaves the light ring on
+    // until Alexa times out on its own. The reply has to carry the way back in,
+    // because closing means the user re-opens the skill to ask.
     if (backgrounded) {
-      log("[LOOP] backgrounded work - replying early without another LLM call");
+      log("[LOOP] backgrounded work - replying early and closing the session");
 
       return {
         role: "assistant",
-        content: "On it. That's running now.",
+        content:
+          "On it. That's running in the background. Open Pluto again and ask for a status update whenever you like.",
+        endSession: true,
       };
     }
 
@@ -404,9 +414,11 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
 };
 
 // Finished work the user was never told about, injected so Pluto can mention
-// it unprompted instead of waiting to be asked.
+// it unprompted instead of waiting to be asked. Read across sessions, because
+// the conversation that started the work is usually not the one that comes back
+// to hear how it went.
 const injectFinishedJobs = (chatMemory, sessionKey) => {
-  const finished = takeUnreportedJobs(sessionKey);
+  const finished = takeUnreportedJobs();
 
   if (!finished.length) {
     return;
@@ -429,10 +441,12 @@ router.post("/alexa", async (req, res) => {
   try {
     const requestType = req.body.request?.type;
 
+    // The conversation is forgotten; the work is not. A session ending is not a
+    // reason to lose a job that is still running, and it used to be: the result
+    // the user came back for was thrown away the moment the light ring went out.
     if (requestType === "SessionEndedRequest") {
-      log(`[TURN] SessionEndedRequest session=${sessionKey}`);
+      log(`[TURN] SessionEndedRequest session=${sessionKey} (${jobCount()} job(s) kept)`);
       sessions.delete(sessionKey);
-      clearSessionJobs(sessionKey);
 
       return res.json(buildAlexaResponse("Goodbye!", true));
     }
@@ -452,9 +466,8 @@ router.post("/alexa", async (req, res) => {
     // "stop" and "cancel" are routed to built-ins by Alexa before any custom
     // intent sees them, so this is the only place they can be caught.
     if (BUILTIN_ENDINGS.has(intentName)) {
-      log(`[TURN] ${intentName} - closing session=${sessionKey}`);
+      log(`[TURN] ${intentName} - closing session=${sessionKey} (${jobCount()} job(s) kept)`);
       sessions.delete(sessionKey);
-      clearSessionJobs(sessionKey);
 
       return res.json(buildAlexaResponse("Goodbye!", true));
     }
@@ -498,17 +511,15 @@ router.post("/alexa", async (req, res) => {
     const normalized = normalizePhrase(userQuery);
 
     if (FAREWELLS.has(normalized)) {
-      log(`[TURN] farewell - closing session=${sessionKey}`);
+      log(`[TURN] farewell - closing session=${sessionKey} (${jobCount()} job(s) kept)`);
       sessions.delete(sessionKey);
-      clearSessionJobs(sessionKey);
 
       return res.json(buildAlexaResponse("You're welcome, goodbye!", true));
     }
 
     if (EXIT_PHRASES.has(normalized)) {
-      log(`[TURN] exit phrase - clearing session=${sessionKey}`);
+      log(`[TURN] exit phrase - closing session=${sessionKey} (${jobCount()} job(s) kept)`);
       sessions.delete(sessionKey);
-      clearSessionJobs(sessionKey);
 
       return res.json(buildAlexaResponse("Exiting AI mode. Goodbye!", true));
     }
@@ -545,9 +556,14 @@ router.post("/alexa", async (req, res) => {
       `[TURN] complete in ${turnTimer()}ms`,
       `history=${chatMemory.messages.length} msgs`,
       `jobs=${jobCount()}`,
+      message.endSession ? "[closing for background work]" : "",
     );
 
-    return res.json(buildAlexaResponse(message.content, false, sessionKey));
+    // The chat memory stays. Nothing is reading it once the session closes, but
+    // the TTL sweep will take it, and keeping it costs nothing meanwhile.
+    return res.json(
+      buildAlexaResponse(message.content, message.endSession === true, sessionKey),
+    );
   } catch (error) {
     logError(`[TURN] failed after ${turnTimer()}ms session=${sessionKey}`);
     logError(error?.stack || error);

@@ -709,12 +709,14 @@ test("the launch greeting is time-aware and names Pluto", async () => {
   assert.equal(r.end, false);
 });
 
-test("the reprompt narrates a job running in that session", async () => {
-  const { clearSessionJobs, registerJob } = await import("../src/data/jobRegistry.js");
+test("the reprompt narrates running work, whichever session started it", async () => {
+  const { clearAllJobs, registerJob } = await import("../src/data/jobRegistry.js");
 
-  clearSessionJobs("rp7");
+  clearAllJobs();
   registerJob({
-    sessionKey: "rp7",
+    // Deliberately not the session doing the asking: work outlives the
+    // conversation that started it, and the reprompt has to say so.
+    sessionKey: "some-earlier-conversation",
     label: "ask Claude to build a landing page",
     narration: "Claude is currently building a landing page",
     promise: new Promise(() => {}),
@@ -725,10 +727,73 @@ test("the reprompt narrates a job running in that session", async () => {
 
   assert.match(busy.reprompt, /Claude is currently building a landing page/);
 
-  // ...and a session with nothing running gets the plain invitation instead.
+  // ...and with nothing running at all, the plain invitation comes back.
+  clearAllJobs();
   scripted.push({ role: "assistant", content: "Anything else?" });
   const idle = await say("rp8", "how's it going");
 
   assert.match(idle.reprompt, /let me know what to do next/i);
-  clearSessionJobs("rp7");
+});
+
+// --- work outliving the conversation -------------------------------------
+
+test("a session ending does not throw away running work", async () => {
+  const { clearAllJobs, getAllJobs, registerJob } = await import("../src/data/jobRegistry.js");
+
+  clearAllJobs();
+  registerJob({
+    sessionKey: "sv1",
+    label: "ask Claude to build a landing page",
+    narration: "Claude is currently building a landing page",
+    promise: new Promise(() => {}),
+  });
+
+  // Every way a session can end. Each one used to take the job with it, which
+  // meant the result the user came back for was gone before they could ask.
+  await post("sv1", { type: "SessionEndedRequest" });
+  assert.equal(getAllJobs().length, 1, "SessionEndedRequest must not clear it");
+
+  await sayIntent("sv1", "AMAZON.StopIntent");
+  assert.equal(getAllJobs().length, 1, "stop must not clear it");
+
+  await say("sv1", "exit pluto");
+  assert.equal(getAllJobs().length, 1, "an exit phrase must not clear it");
+
+  await say("sv1", "thank you");
+  assert.equal(getAllJobs().length, 1, "a farewell must not clear it");
+
+  clearAllJobs();
+});
+
+test("a finished job is reported into whatever conversation comes next", async () => {
+  const { clearAllJobs, registerJob } = await import("../src/data/jobRegistry.js");
+
+  clearAllJobs();
+  registerJob({
+    sessionKey: "gone-conversation",
+    label: "ask Claude to build a landing page",
+    promise: Promise.resolve({ ok: true, output: "created index.html" }),
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // A brand new session id, as re-opening the skill produces. The note has to
+  // reach it anyway, or nothing ever tells the user their build landed.
+  let seen = null;
+  scripted.push({ role: "assistant", content: "Your landing page is done." });
+  const r = await say("a-fresh-session", "is it done");
+
+  seen = r.text;
+  assert.equal(seen, "Your landing page is done.");
+  clearAllJobs();
+});
+
+// --- handing off and closing ---------------------------------------------
+
+test("an ordinary answer still keeps the mic open", async () => {
+  scripted.push({ role: "assistant", content: "It is Thursday." });
+  const r = await say("close2", "what day is it");
+
+  assert.equal(r.end, false);
+  assert.ok(r.reprompt);
 });

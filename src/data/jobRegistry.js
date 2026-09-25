@@ -88,26 +88,28 @@ export const registerJob = ({
   return job;
 };
 
-const jobsForSession = (sessionKey) =>
-  [...jobs.values()].filter((job) => job.sessionKey === sessionKey);
-
-export const getSessionJobs = (sessionKey) => {
+// Read across every session, on purpose. An Alexa sessionId is new each time
+// the skill is opened, so a job outlives the conversation that started it by
+// definition - and the whole point of a background job is that the user can
+// come back later and ask. Scoping these by session would have meant a job
+// finishing into a conversation that no longer exists, with nobody able to ask
+// about it. There is one user and one PC here, so "every session" is "theirs".
+export const getAllJobs = () => {
   sweepJobs();
-  return jobsForSession(sessionKey);
+
+  return [...jobs.values()];
 };
 
-// Finished work this session has not been told about yet.
-export const takeUnreportedJobs = (sessionKey) => {
-  const ready = jobsForSession(sessionKey).filter(
-    (job) => job.status !== "running" && !job.reported,
-  );
+// Finished work nobody has been told about yet.
+export const takeUnreportedJobs = () => {
+  const ready = getAllJobs().filter((job) => job.status !== "running" && !job.reported);
 
   for (const job of ready) {
     job.reported = true;
   }
 
   if (ready.length) {
-    log(`[JOB ] ${ready.length} unreported result(s) for session=${sessionKey}`);
+    log(`[JOB ] ${ready.length} unreported result(s)`);
   }
 
   return ready;
@@ -130,6 +132,10 @@ export const registerDaemon = ({ sessionKey, remoteId, command, cwd = null, url 
   return remoteId;
 };
 
+export const getAllDaemons = () => [...daemons.values()];
+
+// Only for telling the user which servers this conversation started. Anything
+// that acts on servers reads all of them, for the same reason jobs do.
 export const getSessionDaemons = (sessionKey) =>
   [...daemons.values()].filter((daemon) => daemon.sessionKey === sessionKey);
 
@@ -141,11 +147,24 @@ export const forgetDaemon = (remoteId) => {
 
 export const daemonCount = () => daemons.size;
 
-// Work still in flight for this session, oldest first, for the reprompt to
-// narrate. Does not touch `reported` - hearing about a job in a reprompt is not
-// the same as being told it finished.
-export const getRunningJobs = (sessionKey) =>
-  jobsForSession(sessionKey).filter((job) => job.status === "running");
+// Work still in flight, oldest first, for the reprompt to narrate. Does not
+// touch `reported` - hearing about a job in a reprompt is not the same as being
+// told it finished.
+export const getRunningJobs = () => getAllJobs().filter((job) => job.status === "running");
+
+// Neither of these is called from the request path any more: a session ending
+// is not a reason to forget work that is still running, which was the bug. They
+// exist for tests, which read globally now and so need a way to start from
+// nothing.
+export const clearAllJobs = () => {
+  const removed = jobs.size;
+
+  jobs.clear();
+
+  if (removed) {
+    log(`[JOB ] cleared all ${removed} job(s)`);
+  }
+};
 
 export const clearSessionJobs = (sessionKey) => {
   let removed = 0;

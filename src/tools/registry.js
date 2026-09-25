@@ -2,8 +2,9 @@ import { AUTONOMOUS_SUFFIX } from "../data/chatMemory.js";
 import {
   describeJob,
   forgetDaemon,
+  getAllDaemons,
+  getAllJobs,
   getSessionDaemons,
-  getSessionJobs,
   registerDaemon,
 } from "../data/jobRegistry.js";
 import {
@@ -647,6 +648,7 @@ const TOOLS = {
     handler: async (_args, { timeoutMs, sessionKey }) => {
       const result = await execute("list_daemons", {}, { timeoutMs });
       const live = Array.isArray(result?.servers) ? result.servers : [];
+      const tracked = getAllDaemons();
       const mine = getSessionDaemons(sessionKey);
       const liveIds = new Set(live.map((server) => server.job_id));
 
@@ -654,7 +656,7 @@ const TOOLS = {
       // alive - this side only finds out when it asks. A server that crashed on
       // its own would otherwise stay tracked forever, and stop_server would
       // keep aiming at an id that is gone.
-      for (const daemon of mine) {
+      for (const daemon of tracked) {
         if (!liveIds.has(daemon.remoteId)) {
           logWarn(`[TOOL] ${daemon.remoteId} is gone - releasing "${daemon.command}"`);
           forgetDaemon(daemon.remoteId);
@@ -765,15 +767,15 @@ const TOOLS = {
     },
   },
 
-  check_job_status: {
+  check_background_jobs: {
     backgroundable: false,
     describe: () => "check background jobs",
     schema: {
       type: "function",
       function: {
-        name: "check_job_status",
+        name: "check_background_jobs",
         description:
-          "Check background tasks started earlier in this conversation. Call this whenever the user asks whether something finished, wants a status update, or asks about a task you told them you had started.",
+          "Check background tasks - a Claude build, an install, a project being scaffolded. Call this whenever the user asks whether something finished, says 'is it done', asks for a status update, or asks about work you told them you had started, even if that was in an earlier conversation. It reads every job, not only this conversation's, so it still answers after the skill has been closed and re-opened. Report the result it gives you: what finished and what it produced, or that it is still going and roughly how long it has been.",
         parameters: {
           type: "object",
           properties: {
@@ -781,23 +783,27 @@ const TOOLS = {
               // Must accept null: the model sends job_id=null when omitting it, and
               // Groq validates tool arguments server-side and 400s on a bare "string".
               type: ["string", "null"],
-              description: "Optional specific job id. Omit or pass null to list every job in this conversation.",
+              description: "Optional specific job id. Omit or pass null to list every job.",
             },
           },
         },
       },
     },
-    handler: async ({ job_id }, { sessionKey }) => {
-      const all = getSessionJobs(sessionKey);
+    // No sessionKey: a job is looked up across every session on purpose. The
+    // conversation that started it has usually ended by the time anyone asks,
+    // and answering "no tasks in this conversation" while one is running would
+    // be the wrong answer to the only question the user came back with.
+    handler: async ({ job_id: jobId }) => {
+      const all = getAllJobs();
 
       if (!all.length) {
-        return { ok: true, jobs: [], note: "No background tasks have been started in this conversation." };
+        return { ok: true, jobs: [], note: "Nothing has been started in the background." };
       }
 
-      const matched = job_id ? all.filter((job) => job.id === job_id) : all;
+      const matched = jobId ? all.filter((job) => job.id === jobId) : all;
 
       if (!matched.length) {
-        return { ok: false, error: `No job "${job_id}" in this conversation.` };
+        return { ok: false, error: `No job "${jobId}".` };
       }
 
       // Only a finished job counts as reported - marking a running one would
@@ -808,7 +814,13 @@ const TOOLS = {
         }
       }
 
-      return { ok: true, jobs: matched.map(describeJob) };
+      const running = matched.filter((job) => job.status === "running").length;
+
+      return {
+        ok: true,
+        jobs: matched.map(describeJob),
+        ...(running ? { still_running: running } : {}),
+      };
     },
   },
 };

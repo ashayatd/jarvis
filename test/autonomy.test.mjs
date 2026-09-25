@@ -167,6 +167,6 @@ test("the narration stays short when there is no project", () => {
 });
 
 test("a tool with nothing to narrate returns nothing", () => {
-  assert.equal(narrateToolCall("check_job_status", {}), null);
+  assert.equal(narrateToolCall("check_background_jobs", {}), null);
   assert.equal(narrateToolCall("no_such_tool", {}), null);
 });

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  clearAllJobs,
   clearSessionJobs,
   forgetDaemon,
   registerDaemon,
@@ -94,16 +95,16 @@ const idleSession = "reprompt-idle";
 const busySession = "reprompt-busy";
 
 test("with nothing running the reprompt is a plain invitation", () => {
-  clearSessionJobs(idleSession);
+  clearAllJobs();
 
-  const reprompt = repromptFor(idleSession);
+  const reprompt = repromptFor();
 
   assert.match(reprompt, /let me know what to do next/i);
   assert.doesNotMatch(reprompt, /seconds in/);
 });
 
 test("with a job running the reprompt narrates that job", () => {
-  clearSessionJobs(busySession);
+  clearAllJobs();
 
   registerJob({
     sessionKey: busySession,
@@ -113,7 +114,7 @@ test("with a job running the reprompt narrates that job", () => {
     promise: new Promise(() => {}),
   });
 
-  const reprompt = repromptFor(busySession);
+  const reprompt = repromptFor();
 
   assert.match(reprompt, /Claude is currently building a landing page/);
   assert.match(reprompt, /seconds in/);
@@ -128,7 +129,7 @@ test("a second job is counted rather than read out as well", () => {
     promise: new Promise(() => {}),
   });
 
-  const reprompt = repromptFor(busySession);
+  const reprompt = repromptFor();
 
   // One narration and a count: reading every job aloud would be a paragraph.
   assert.match(reprompt, /1 other job running too/);
@@ -136,7 +137,7 @@ test("a second job is counted rather than read out as well", () => {
 
 test("a job that has landed stops being narrated", async () => {
   const session = "reprompt-finished";
-  clearSessionJobs(session);
+  clearAllJobs();
 
   registerJob({
     sessionKey: session,
@@ -148,13 +149,12 @@ test("a job that has landed stops being narrated", async () => {
   // Let the registry record the outcome.
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  assert.match(repromptFor(session), /let me know what to do next/i);
-  clearSessionJobs(session);
+  assert.match(repromptFor(), /let me know what to do next/i);
+  clearAllJobs();
 });
 
-test("one session's work is never narrated into another", () => {
-  clearSessionJobs("session-a");
-  clearSessionJobs("session-b");
+test("work from an earlier conversation is still narrated", () => {
+  clearAllJobs();
 
   registerJob({
     sessionKey: "session-a",
@@ -163,11 +163,13 @@ test("one session's work is never narrated into another", () => {
     promise: new Promise(() => {}),
   });
 
-  assert.match(repromptFor("session-a"), /building the thing/);
-  assert.match(repromptFor("session-b"), /let me know what to do next/i);
+  // Deliberately the opposite of what this asserted before. Starting long work
+  // now closes the session, so the conversation that comes back to hear about
+  // it always has a different id - scoping the reprompt by session would mean
+  // never mentioning the very job the user re-opened the skill for.
+  assert.match(repromptFor(), /building the thing/);
 
-  clearSessionJobs("session-a");
-  clearSessionJobs(busySession);
+  clearAllJobs();
 });
 
 // --- the reprompt knows about servers too --------------------------------
@@ -175,7 +177,7 @@ test("one session's work is never narrated into another", () => {
 const serverSession = "reprompt-server";
 
 test("a running server is woven into the reprompt with its port", () => {
-  clearSessionJobs(serverSession);
+  clearAllJobs();
   registerDaemon({
     sessionKey: serverSession,
     remoteId: "d-one",
@@ -183,7 +185,7 @@ test("a running server is woven into the reprompt with its port", () => {
     url: "http://localhost:5173/",
   });
 
-  const reprompt = repromptFor(serverSession);
+  const reprompt = repromptFor();
 
   assert.match(reprompt, /dev server is running on port 5173/);
   assert.match(reprompt, /what's next/i);
@@ -198,7 +200,7 @@ test("a running server is woven into the reprompt with its port", () => {
 test("a server that printed no address is still mentioned, without a port", () => {
   registerDaemon({ sessionKey: serverSession, remoteId: "d-quiet", command: "python app.py" });
 
-  const reprompt = repromptFor(serverSession);
+  const reprompt = repromptFor();
 
   assert.match(reprompt, /The dev server is running\./);
   // Inventing a port is worse than not naming one.
@@ -211,14 +213,14 @@ test("several servers are counted rather than listed", () => {
   registerDaemon({ sessionKey: serverSession, remoteId: "d-a", command: "npm run dev", url: "http://localhost:5173/" });
   registerDaemon({ sessionKey: serverSession, remoteId: "d-b", command: "npm start", url: "http://localhost:3000/" });
 
-  assert.match(repromptFor(serverSession), /2 dev servers are running/);
+  assert.match(repromptFor(), /2 dev servers are running/);
 
   forgetDaemon("d-a");
   forgetDaemon("d-b");
 });
 
 test("a job and a server are both mentioned, with the job leading", () => {
-  clearSessionJobs(serverSession);
+  clearAllJobs();
   registerDaemon({
     sessionKey: serverSession,
     remoteId: "d-both",
@@ -232,7 +234,7 @@ test("a job and a server are both mentioned, with the job leading", () => {
     promise: new Promise(() => {}),
   });
 
-  const reprompt = repromptFor(serverSession);
+  const reprompt = repromptFor();
 
   // The job is what the user is waiting on, so it goes first and keeps the
   // closing line; the server is the aside.
@@ -245,17 +247,20 @@ test("a job and a server are both mentioned, with the job leading", () => {
   assert.match(reprompt, /tell you when it lands/);
 
   forgetDaemon("d-both");
-  clearSessionJobs(serverSession);
+  clearAllJobs();
 });
 
-test("a server tracked for another session is not mentioned in this one", () => {
+test("a server started in an earlier conversation is still mentioned", () => {
   registerDaemon({ sessionKey: "somebody-else", remoteId: "d-theirs", command: "npm run dev" });
 
-  assert.match(repromptFor("reprompt-nobody"), /let me know what to do next/i);
+  // Same reasoning as jobs: the session that started it is gone by the time
+  // anyone hears a reprompt, and staying quiet about a running server would
+  // make the reprompt useless in exactly the case it was built for.
+  assert.match(repromptFor(), /dev server is running/);
 
   forgetDaemon("d-theirs");
 });
 
 test("with the server released the reprompt goes back to the plain invitation", () => {
-  assert.match(repromptFor(serverSession), /let me know what to do next/i);
+  assert.match(repromptFor(), /let me know what to do next/i);
 });
