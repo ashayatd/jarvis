@@ -23,6 +23,9 @@ let daemonReply = {
 // Likewise for stopping: the interesting cases are the ones that do not work.
 let stopReply = { ok: true, stopped: ["stubd"], already_stopped: [] };
 
+// What the executor says is still alive, which is the only authority on that.
+let listReply = { ok: true, servers: [] };
+
 const stub = http.createServer((req, res) => {
   let body = "";
 
@@ -40,6 +43,8 @@ const stub = http.createServer((req, res) => {
       reply = daemonReply;
     } else if (command === "stop_daemon") {
       reply = stopReply;
+    } else if (command === "list_daemons") {
+      reply = listReply;
     } else if (command === "job_status") {
       reply = { ok: true, status: "done", output: "(stub finished)" };
     } else {
@@ -467,4 +472,97 @@ test("a server is not forgotten when it could not be stopped", async () => {
 
   const stop = sent.find((call) => call.command === "stop_daemon");
   assert.equal(stop.args.job_id, "d-npmrunserve");
+});
+
+// --- asking what is running ----------------------------------------------
+
+const checkCall = () => ({
+  function: { name: "check_running_servers", arguments: "{}" },
+});
+
+test("check_running_servers reports nothing when nothing is up", async () => {
+  listReply = { ok: true, servers: [] };
+
+  const result = await runTool(checkCall(), { sessionKey: "look-1" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.count, 0);
+  assert.deepEqual(result.servers, []);
+  assert.match(result.note, /Nothing is running/);
+});
+
+test("it reports what the executor says is alive, with the address this side knows", async () => {
+  await startServer("look-2", "npm run dev");
+
+  listReply = {
+    ok: true,
+    servers: [
+      { job_id: "d-npmrundev", command: "npm run dev (in landing-page)", pid: 4242, uptime_seconds: 31.4 },
+    ],
+  };
+
+  const result = await runTool(checkCall(), { sessionKey: "look-2" });
+
+  assert.equal(result.count, 1);
+  assert.equal(result.servers[0].pid, 4242);
+  assert.equal(result.servers[0].uptime_seconds, 31.4);
+  // The port came from the server's own output at spawn, which only this side
+  // recorded - the executor's listing does not carry it.
+  assert.equal(result.servers[0].url, "http://localhost:5173/");
+  assert.equal(result.servers[0].started_here, true);
+});
+
+test("a server this conversation did not start is reported but not claimed", async () => {
+  listReply = {
+    ok: true,
+    servers: [{ job_id: "d-somebody-elses", command: "npm start", pid: 99, uptime_seconds: 5 }],
+  };
+
+  const result = await runTool(checkCall(), { sessionKey: "look-3" });
+
+  assert.equal(result.count, 1);
+  assert.equal(result.servers[0].started_here, false);
+  assert.ok(!("url" in result.servers[0]));
+});
+
+test("a server that died on its own stops being tracked", async () => {
+  await startServer("look-4", "npm run serve");
+
+  // The executor no longer lists it: the process crashed, and nothing on this
+  // side would ever have found out without asking.
+  listReply = { ok: true, servers: [] };
+  await runTool(checkCall(), { sessionKey: "look-4" });
+
+  // So a later stop falls back to whatever is up, rather than aiming at a dead
+  // id and reporting success for a server nobody stopped.
+  stopReply = { ok: true, stopped: [], already_stopped: [] };
+  sent.length = 0;
+  const stopped = await runTool(stopCall(), { sessionKey: "look-4" });
+
+  const stop = sent.find((call) => call.command === "stop_daemon");
+  assert.equal(stop.args.all, true);
+  assert.equal(stopped.stopped, 0);
+});
+
+test("a server still listed stays tracked", async () => {
+  await startServer("look-5", "npm start");
+
+  listReply = {
+    ok: true,
+    servers: [{ job_id: "d-npmstart", command: "npm start", pid: 7, uptime_seconds: 2 }],
+  };
+  await runTool(checkCall(), { sessionKey: "look-5" });
+
+  stopReply = { ok: true, stopped: ["d-npmstart"], already_stopped: [] };
+  sent.length = 0;
+  await runTool(stopCall(), { sessionKey: "look-5" });
+
+  const stop = sent.find((call) => call.command === "stop_daemon");
+  assert.equal(stop.args.job_id, "d-npmstart", "should still target it by id");
+});
+
+test("check_running_servers is never turned into a background job", async () => {
+  const { isBackgroundable } = await import("../src/tools/registry.js");
+
+  assert.equal(isBackgroundable("check_running_servers"), false);
 });

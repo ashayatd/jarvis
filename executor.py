@@ -268,6 +268,39 @@ def _kill_tree(proc, label):
     return None
 
 
+def _reap_daemon(job_id, proc):
+    """Record that a server has exited on its own, and clear up after it.
+
+    Something has to notice. Nothing waits on a daemon, so a server that
+    crashes stays marked running until the next time anyone looks - and its
+    output file stays in the temp directory for good unless it is removed here.
+    Safe to call repeatedly.
+    """
+    _daemons.pop(job_id, None)
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        log_path = job.get("log") if job else None
+        already_finished = bool(job and job["finished_at"])
+
+    # Read before removing: whatever it printed on the way down is the answer to
+    # "why did my server stop", and deleting the file first would throw it away.
+    output = _read_tail(log_path) if log_path else ""
+
+    if not already_finished:
+        _finish(
+            job_id,
+            "done" if proc.returncode == 0 else "failed",
+            returncode=proc.returncode,
+            error=None if proc.returncode == 0 else f"exited with code {proc.returncode}",
+            **({"output": output} if output else {}),
+        )
+        print(f"[EXEC] {job_id} exited on its own, rc={proc.returncode}")
+
+    if log_path:
+        _remove_quietly(log_path)
+
+
 def _read_tail(path):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -693,7 +726,10 @@ def execute():
         running = []
 
         for job_id, proc in list(_daemons.items()):
+            # Asking what is running is the moment anything finds out that
+            # something is not, so this is where the dead get cleared up.
             if proc.poll() is not None:
+                _reap_daemon(job_id, proc)
                 continue
 
             with _jobs_lock:
@@ -842,13 +878,7 @@ def execute():
         daemon = _daemons.get(job_id)
 
         if daemon is not None and daemon.poll() is not None:
-            _daemons.pop(job_id, None)
-            _finish(
-                job_id,
-                "done" if daemon.returncode == 0 else "failed",
-                returncode=daemon.returncode,
-                error=None if daemon.returncode == 0 else f"exited with code {daemon.returncode}",
-            )
+            _reap_daemon(job_id, daemon)
 
         with _jobs_lock:
             job = _jobs.get(job_id)

@@ -630,6 +630,55 @@ const TOOLS = {
     },
   },
 
+  check_running_servers: {
+    // Never a job, for the same reason as check_job_status: asking what is
+    // running must not itself become something to wait for.
+    backgroundable: false,
+    describe: () => "check running servers",
+    schema: {
+      type: "function",
+      function: {
+        name: "check_running_servers",
+        description:
+          "List the dev servers currently running on the user's PC, with their addresses and how long they have been up. Call this whenever the user asks what is running, what servers or environments are active, whether a project is still up, or for the state of their dev environment. It is instant and read-only.",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+    handler: async (_args, { timeoutMs, sessionKey }) => {
+      const result = await execute("list_daemons", {}, { timeoutMs });
+      const live = Array.isArray(result?.servers) ? result.servers : [];
+      const mine = getSessionDaemons(sessionKey);
+      const liveIds = new Set(live.map((server) => server.job_id));
+
+      // The executor is the only thing that knows whether a process is still
+      // alive - this side only finds out when it asks. A server that crashed on
+      // its own would otherwise stay tracked forever, and stop_server would
+      // keep aiming at an id that is gone.
+      for (const daemon of mine) {
+        if (!liveIds.has(daemon.remoteId)) {
+          logWarn(`[TOOL] ${daemon.remoteId} is gone - releasing "${daemon.command}"`);
+          forgetDaemon(daemon.remoteId);
+        }
+      }
+
+      const byId = new Map(mine.map((daemon) => [daemon.remoteId, daemon]));
+
+      return {
+        ok: true,
+        count: live.length,
+        servers: live.map((server) => ({
+          ...server,
+          // The address only this side knows, from when the server printed it.
+          ...(byId.get(server.job_id)?.url ? { url: byId.get(server.job_id).url } : {}),
+          // Whether this conversation is the one that started it, so the model
+          // can say "the server I started" rather than guessing.
+          started_here: byId.has(server.job_id),
+        })),
+        ...(live.length ? {} : { note: "Nothing is running." }),
+      };
+    },
+  },
+
   stop_server: {
     // Never a job: stopping is the thing the user is waiting to hear about, and
     // taskkill returns in moments.

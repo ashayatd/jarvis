@@ -4,7 +4,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { clearSessionJobs, registerJob } from "../src/data/jobRegistry.js";
+import {
+  clearSessionJobs,
+  forgetDaemon,
+  registerDaemon,
+  registerJob,
+} from "../src/data/jobRegistry.js";
 import { greetingFor, repromptFor, toSsml } from "../src/routes/alexaRoutes.js";
 
 // --- the SSML document ----------------------------------------------------
@@ -163,4 +168,94 @@ test("one session's work is never narrated into another", () => {
 
   clearSessionJobs("session-a");
   clearSessionJobs(busySession);
+});
+
+// --- the reprompt knows about servers too --------------------------------
+
+const serverSession = "reprompt-server";
+
+test("a running server is woven into the reprompt with its port", () => {
+  clearSessionJobs(serverSession);
+  registerDaemon({
+    sessionKey: serverSession,
+    remoteId: "d-one",
+    command: "npm run dev",
+    url: "http://localhost:5173/",
+  });
+
+  const reprompt = repromptFor(serverSession);
+
+  assert.match(reprompt, /dev server is running on port 5173/);
+  assert.match(reprompt, /what's next/i);
+
+  // No job is waiting, so it must not claim anything is going to land.
+  assert.doesNotMatch(reprompt, /seconds in/);
+  assert.doesNotMatch(reprompt, /tell you when it lands/);
+
+  forgetDaemon("d-one");
+});
+
+test("a server that printed no address is still mentioned, without a port", () => {
+  registerDaemon({ sessionKey: serverSession, remoteId: "d-quiet", command: "python app.py" });
+
+  const reprompt = repromptFor(serverSession);
+
+  assert.match(reprompt, /The dev server is running\./);
+  // Inventing a port is worse than not naming one.
+  assert.doesNotMatch(reprompt, /port/);
+
+  forgetDaemon("d-quiet");
+});
+
+test("several servers are counted rather than listed", () => {
+  registerDaemon({ sessionKey: serverSession, remoteId: "d-a", command: "npm run dev", url: "http://localhost:5173/" });
+  registerDaemon({ sessionKey: serverSession, remoteId: "d-b", command: "npm start", url: "http://localhost:3000/" });
+
+  assert.match(repromptFor(serverSession), /2 dev servers are running/);
+
+  forgetDaemon("d-a");
+  forgetDaemon("d-b");
+});
+
+test("a job and a server are both mentioned, with the job leading", () => {
+  clearSessionJobs(serverSession);
+  registerDaemon({
+    sessionKey: serverSession,
+    remoteId: "d-both",
+    command: "npm run dev",
+    url: "http://localhost:5173/",
+  });
+  registerJob({
+    sessionKey: serverSession,
+    label: "ask Claude to add a hero section",
+    narration: "Claude is currently building a hero section",
+    promise: new Promise(() => {}),
+  });
+
+  const reprompt = repromptFor(serverSession);
+
+  // The job is what the user is waiting on, so it goes first and keeps the
+  // closing line; the server is the aside.
+  assert.ok(
+    reprompt.indexOf("hero section") < reprompt.indexOf("port 5173"),
+    `job should lead: ${reprompt}`,
+  );
+  assert.match(reprompt, /seconds in/);
+  assert.match(reprompt, /port 5173/);
+  assert.match(reprompt, /tell you when it lands/);
+
+  forgetDaemon("d-both");
+  clearSessionJobs(serverSession);
+});
+
+test("a server tracked for another session is not mentioned in this one", () => {
+  registerDaemon({ sessionKey: "somebody-else", remoteId: "d-theirs", command: "npm run dev" });
+
+  assert.match(repromptFor("reprompt-nobody"), /let me know what to do next/i);
+
+  forgetDaemon("d-theirs");
+});
+
+test("with the server released the reprompt goes back to the plain invitation", () => {
+  assert.match(repromptFor(serverSession), /let me know what to do next/i);
 });

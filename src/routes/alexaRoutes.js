@@ -12,6 +12,7 @@ import {
   clearSessionJobs,
   describeJob,
   getRunningJobs,
+  getSessionDaemons,
   jobCount,
   registerJob,
   takeUnreportedJobs,
@@ -64,14 +65,39 @@ export const greetingFor = (hour) => {
   return "Working late! Pluto is here!!";
 };
 
-// What the mic-open reprompt should say right now. A job in flight is more
-// useful than a stock line - it is the only way the user hears that Claude is
-// still working without having to ask.
+// The port a server reported, for the reprompt to name. Best effort: a server
+// that printed nothing leaves this null and the phrasing drops the port rather
+// than inventing one.
+const portOf = (url) => {
+  try {
+    return new URL(url).port || null;
+  } catch {
+    return null;
+  }
+};
+
+const describeServers = (servers) => {
+  if (servers.length > 1) {
+    return `${servers.length} dev servers are running.`;
+  }
+
+  const port = servers[0].url ? portOf(servers[0].url) : null;
+
+  return port ? `The dev server is running on port ${port}.` : "The dev server is running.";
+};
+
+// What the mic-open reprompt should say right now, from both things that can be
+// in flight: work being waited on, and servers that are simply up. Either is
+// more useful than a stock line - a reprompt is the only place the user hears
+// about them without having to ask.
 export const repromptFor = (sessionKey) => {
   const running = getRunningJobs(sessionKey);
+  const servers = getSessionDaemons(sessionKey);
 
   if (!running.length) {
-    return IDLE_REPROMPT;
+    return servers.length
+      ? `${describeServers(servers)} Let me know what's next.`
+      : IDLE_REPROMPT;
   }
 
   const [first] = running;
@@ -80,7 +106,11 @@ export const repromptFor = (sessionKey) => {
   const others =
     running.length > 1 ? ` I have ${running.length - 1} other job running too.` : "";
 
-  return `${what}, about ${elapsed} seconds in.${others} I'll tell you when it lands.`;
+  // A server alongside the work is worth one clause, not a second sentence
+  // competing with it - the job is the thing the user is waiting on.
+  const alongside = servers.length ? ` ${describeServers(servers)}` : "";
+
+  return `${what}, about ${elapsed} seconds in.${others}${alongside} I'll tell you when it lands.`;
 };
 
 // Matched exactly, not by substring, so "thanks for that, now open vs code"
