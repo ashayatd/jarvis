@@ -229,6 +229,45 @@ def _sweep_jobs():
         print(f"[EXEC] swept {len(expired)} expired job(s)")
 
 
+def _remove_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        # A log left in the temp directory is not worth failing a request over.
+        pass
+
+
+def _kill_tree(proc, label):
+    """Kill a spawned server and everything it started.
+
+    proc.terminate() is not enough here. shell=True means the handle we hold is
+    cmd.exe, and the node or python process doing the actual serving is its
+    child - terminating the shell would leave that orphaned, still holding the
+    port, and the next "npm run dev" would fail on an address already in use.
+    taskkill /T walks the tree; /F does not ask it politely.
+    """
+    if os.name != "nt":
+        proc.kill()
+
+        return None
+
+    killed = subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    detail = (killed.stdout or killed.stderr or "").strip()
+    print(f"[EXEC] taskkill rc={killed.returncode} for {label}: {detail}")
+
+    # rc 128 is "no such process": already gone, which is the outcome asked for.
+    if killed.returncode not in (0, 128):
+        return detail or f"taskkill exited with {killed.returncode}"
+
+    return None
+
+
 def _read_tail(path):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -268,6 +307,8 @@ def _start_daemon(shell_command, cwd, label):
         prefix=f"pluto-{job_id}-", suffix=".log", delete=False, mode="w", encoding="utf-8"
     )
 
+    log_path = log.name
+
     try:
         proc = subprocess.Popen(
             shell_command,
@@ -280,9 +321,15 @@ def _start_daemon(shell_command, cwd, label):
         )
     except OSError as error:
         log.close()
+        _remove_quietly(log_path)
         print(f"[EXEC] {job_id} could not start: {error}")
 
         return {"ok": False, "error": f"'{label}' could not be started: {error}"}
+
+    # Closed here, not later: the child holds its own descriptor and keeps
+    # writing, while this handle would otherwise be the reason Windows refuses
+    # to delete the file when the server is stopped.
+    log.close()
 
     print(f"[EXEC] {job_id} spawned pid={proc.pid}: {label}")
 
@@ -291,8 +338,7 @@ def _start_daemon(shell_command, cwd, label):
     time.sleep(DAEMON_CONFIRM_S)
 
     code = proc.poll()
-    log.flush()
-    output = _read_tail(log.name)
+    output = _read_tail(log_path)
     elapsed = round(time.time() - started, 1)
 
     with _jobs_lock:
@@ -302,7 +348,7 @@ def _start_daemon(shell_command, cwd, label):
             "command": label,
             "cwd": cwd or WORKDIR,
             "pid": proc.pid,
-            "log": log.name,
+            "log": log_path,
             "started_at": started,
             "finished_at": None if code is None else time.time(),
         }
@@ -312,8 +358,8 @@ def _start_daemon(shell_command, cwd, label):
     # separates them, and both are reported as what they are rather than as
     # "running in the background".
     if code is not None:
-        log.close()
         _daemons.pop(job_id, None)
+        _remove_quietly(log_path)
         print(f"[EXEC] {job_id} exited rc={code} after {elapsed}s")
 
         if code == 0:
@@ -564,6 +610,103 @@ def execute():
         result = _start_daemon(shell_command, job_cwd, label)
 
         return jsonify({**result, "cwd": job_cwd})
+
+    # Stops one server by id, or every one still up with all=true. The second
+    # form exists because an Alexa session is short and a dev server outlives
+    # it: by the time the user says "stop the server" the conversation that
+    # started it may be long gone, and refusing on those grounds would be
+    # useless to them.
+    if command == "stop_daemon":
+        args = data.get("args", {})
+        job_id = args.get("job_id") or ""
+        stop_all = bool(args.get("all"))
+
+        if not job_id and not stop_all:
+            return jsonify({"ok": False, "error": "No job_id given, and all was not set."}), 400
+
+        targets = list(_daemons.keys()) if stop_all else [job_id]
+        stopped = []
+        already = []
+        problems = []
+
+        for target in targets:
+            proc = _daemons.get(target)
+
+            with _jobs_lock:
+                job = _jobs.get(target)
+                label = job["command"] if job else target
+                log_path = job.get("log") if job else None
+
+            if proc is None:
+                if job is None:
+                    problems.append(f"Unknown job: {target}")
+                else:
+                    already.append(target)
+                    if log_path:
+                        _remove_quietly(log_path)
+
+                continue
+
+            if proc.poll() is not None:
+                # Died on its own before anyone asked it to stop.
+                _daemons.pop(target, None)
+                _finish(target, "done" if proc.returncode == 0 else "failed",
+                        returncode=proc.returncode)
+                already.append(target)
+
+                if log_path:
+                    _remove_quietly(log_path)
+
+                continue
+
+            failure = _kill_tree(proc, label)
+
+            if failure:
+                problems.append(f"{label}: {failure}")
+                continue
+
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                problems.append(f"{label}: still alive after taskkill")
+                continue
+
+            _daemons.pop(target, None)
+            _finish(target, "stopped", returncode=proc.returncode)
+            stopped.append(target)
+
+            # Only once the tree is dead: while any of it is alive Windows keeps
+            # a handle on this file and the unlink would fail.
+            if log_path:
+                _remove_quietly(log_path)
+
+            print(f"[EXEC] {target} stopped: {label}")
+
+        return jsonify({
+            "ok": not problems,
+            "stopped": stopped,
+            "already_stopped": already,
+            **({"problems": problems} if problems else {}),
+        })
+
+    if command == "list_daemons":
+        running = []
+
+        for job_id, proc in list(_daemons.items()):
+            if proc.poll() is not None:
+                continue
+
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+
+            running.append({
+                "job_id": job_id,
+                "command": job["command"] if job else "(unknown)",
+                "pid": proc.pid,
+                "uptime_seconds": round(time.time() - job["started_at"], 1) if job else None,
+            })
+
+        return jsonify({"ok": True, "servers": running})
 
     # Deliberately instant and read-only: this is what lets the assistant ask
     # "which project?" and act on the answer inside one spoken turn.

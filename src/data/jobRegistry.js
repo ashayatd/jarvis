@@ -113,6 +113,34 @@ export const takeUnreportedJobs = (sessionKey) => {
   return ready;
 };
 
+// Servers this session started, which are not jobs: nothing is waiting on one,
+// and it outlives the turn that started it. Tracked only so "stop the server"
+// knows what to stop - the executor owns the actual process.
+//
+// Deliberately not swept and not cleared when a session ends. A dev server is
+// meant to outlive the conversation, and killing one because the user said
+// goodbye would be a surprising way to lose your work.
+const daemons = new Map();
+
+export const registerDaemon = ({ sessionKey, remoteId, command, cwd = null, url = null }) => {
+  daemons.set(remoteId, { remoteId, sessionKey, command, cwd, url, startedAt: Date.now() });
+
+  log(`[DMN ] ${remoteId} tracked session=${sessionKey} "${command}" (${daemons.size} running)`);
+
+  return remoteId;
+};
+
+export const getSessionDaemons = (sessionKey) =>
+  [...daemons.values()].filter((daemon) => daemon.sessionKey === sessionKey);
+
+export const forgetDaemon = (remoteId) => {
+  if (daemons.delete(remoteId)) {
+    log(`[DMN ] ${remoteId} released (${daemons.size} running)`);
+  }
+};
+
+export const daemonCount = () => daemons.size;
+
 // Work still in flight for this session, oldest first, for the reprompt to
 // narrate. Does not touch `reported` - hearing about a job in a reprompt is not
 // the same as being told it finished.

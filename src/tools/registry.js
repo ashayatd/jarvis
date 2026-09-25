@@ -1,5 +1,11 @@
 import { AUTONOMOUS_SUFFIX } from "../data/chatMemory.js";
-import { describeJob, getSessionJobs } from "../data/jobRegistry.js";
+import {
+  describeJob,
+  forgetDaemon,
+  getSessionDaemons,
+  getSessionJobs,
+  registerDaemon,
+} from "../data/jobRegistry.js";
 import {
   execute,
   INLINE_TIMEOUT_MS,
@@ -350,7 +356,7 @@ const TOOLS = {
         },
       },
     },
-    handler: async ({ command, cwd, open_browser: openBrowser, port }, { timeoutMs }) => {
+    handler: async ({ command, cwd, open_browser: openBrowser, port }, { timeoutMs, sessionKey }) => {
       if (!command) {
         return { ok: false, error: "No command given." };
       }
@@ -413,14 +419,29 @@ const TOOLS = {
           };
         }
 
+        const opened = await openIfAsked({ openBrowser, port, url: started?.url, timeoutMs });
+
+        // Tracked so stop_server has something to stop. Without this the
+        // process is running with nothing on this side knowing it exists.
+        if (started?.job_id) {
+          registerDaemon({
+            sessionKey,
+            remoteId: started.job_id,
+            command,
+            cwd: folder || null,
+            url: opened.url ?? started?.url ?? null,
+          });
+        }
+
         return {
           ok: true,
           status: "running",
           started: true,
           message: "Dev server is running in background",
           command,
+          ...(started?.job_id ? { job_id: started.job_id } : {}),
           ...(folder ? { cwd: folder } : {}),
-          ...(await openIfAsked({ openBrowser, port, url: started?.url, timeoutMs })),
+          ...opened,
         };
       }
 
@@ -606,6 +627,92 @@ const TOOLS = {
       }
 
       return execute("init_project", { project }, { timeoutMs });
+    },
+  },
+
+  stop_server: {
+    // Never a job: stopping is the thing the user is waiting to hear about, and
+    // taskkill returns in moments.
+    backgroundable: false,
+    describe: (args) => `stop ${args.job_id ? `server ${args.job_id}` : "the running server"}`,
+    schema: {
+      type: "function",
+      function: {
+        name: "stop_server",
+        description:
+          "Stop a dev server started earlier. Call this when the user asks to stop the server, shut the project down, or kill the dev environment. Takes no arguments in the normal case - it stops the server running in this conversation, or the ones still up from an earlier one if this conversation started none.",
+        parameters: {
+          type: "object",
+          properties: {
+            job_id: {
+              // Must accept null: the model sends job_id=null when omitting it,
+              // and Groq validates tool arguments server-side and 400s on a
+              // bare "string".
+              type: ["string", "null"],
+              description:
+                "Only when stopping one specific server out of several, using an id from a previous result. Omit or pass null to stop the server in this conversation.",
+            },
+          },
+        },
+      },
+    },
+    handler: async ({ job_id: jobId }, { timeoutMs, sessionKey }) => {
+      const mine = getSessionDaemons(sessionKey);
+
+      if (jobId) {
+        // Confined to this conversation's own servers. Two sessions on one
+        // machine should not be able to reach into each other by guessing ids.
+        if (!mine.some((daemon) => daemon.remoteId === jobId)) {
+          return {
+            ok: false,
+            error: `No server ${jobId} was started in this conversation.`,
+          };
+        }
+
+        const result = await execute("stop_daemon", { job_id: jobId }, { timeoutMs });
+
+        if (result?.ok !== false) {
+          forgetDaemon(jobId);
+        }
+
+        return { ok: result?.ok !== false, stopped: 1, ...(result?.ok === false ? result : {}) };
+      }
+
+      // Nothing tracked here. An Alexa session is short and a dev server
+      // outlives it, so by the time someone says "stop the server" the
+      // conversation that started it is usually gone - falling back to whatever
+      // is still up is the only reading of that request that helps them.
+      if (!mine.length) {
+        const result = await execute("stop_daemon", { all: true }, { timeoutMs });
+        const stopped = result?.stopped?.length ?? 0;
+
+        if (!stopped && !(result?.already_stopped?.length ?? 0)) {
+          return { ok: true, stopped: 0, note: "No server was running." };
+        }
+
+        return { ok: result?.ok !== false, stopped, note: "Stopped what was still running." };
+      }
+
+      const results = [];
+
+      for (const daemon of mine) {
+        const result = await execute("stop_daemon", { job_id: daemon.remoteId }, { timeoutMs });
+
+        if (result?.ok !== false) {
+          forgetDaemon(daemon.remoteId);
+        }
+
+        results.push({ command: daemon.command, ok: result?.ok !== false });
+      }
+
+      const failed = results.filter((entry) => !entry.ok);
+
+      return {
+        ok: !failed.length,
+        stopped: results.length - failed.length,
+        servers: results.map((entry) => entry.command),
+        ...(failed.length ? { error: `Could not stop ${failed.map((e) => e.command).join(", ")}.` } : {}),
+      };
     },
   },
 

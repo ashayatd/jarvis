@@ -20,6 +20,9 @@ let daemonReply = {
   url: "http://localhost:5173/",
 };
 
+// Likewise for stopping: the interesting cases are the ones that do not work.
+let stopReply = { ok: true, stopped: ["stubd"], already_stopped: [] };
+
 const stub = http.createServer((req, res) => {
   let body = "";
 
@@ -35,6 +38,8 @@ const stub = http.createServer((req, res) => {
 
     if (command === "start_daemon") {
       reply = daemonReply;
+    } else if (command === "stop_daemon") {
+      reply = stopReply;
     } else if (command === "job_status") {
       reply = { ok: true, status: "done", output: "(stub finished)" };
     } else {
@@ -346,4 +351,120 @@ test("open_browser is ignored for a command that is not a server", async () => {
 
   assert.equal(calls[0].command, "run_command");
   assert.ok(!calls.some((call) => call.args?.command?.startsWith("start ")));
+});
+
+// --- stopping a server ---------------------------------------------------
+
+const stopCall = (jobId) => ({
+  function: { name: "stop_server", arguments: JSON.stringify(jobId ? { job_id: jobId } : {}) },
+});
+
+const startServer = async (sessionKey, command = "npm run dev") => {
+  daemonReply = {
+    ok: true,
+    status: "running",
+    started: true,
+    job_id: `d-${command.replace(/\W/g, "")}`,
+    url: "http://localhost:5173/",
+  };
+
+  sent.length = 0;
+  const result = await runTool(shellCall(command, { cwd: "landing page" }), { sessionKey });
+
+  return result;
+};
+
+test("starting a server hands back an id to stop it with", async () => {
+  const result = await startServer("stop-1");
+
+  assert.equal(result.started, true);
+  assert.ok(result.job_id, "the id has to come back or nothing can stop it");
+});
+
+test("stop_server stops the server this conversation started", async () => {
+  await startServer("stop-2");
+
+  sent.length = 0;
+  const result = await runTool(stopCall(), { sessionKey: "stop-2" });
+
+  const stop = sent.find((call) => call.command === "stop_daemon");
+
+  assert.ok(stop, "nothing was asked to stop");
+  assert.equal(stop.args.job_id, "d-npmrundev");
+  assert.equal(result.ok, true);
+  assert.equal(result.stopped, 1);
+});
+
+test("stopping twice does not try to stop it again", async () => {
+  // The first stop released it, so the second finds nothing of its own and
+  // falls through to whatever is still up.
+  sent.length = 0;
+  const result = await runTool(stopCall(), { sessionKey: "stop-2" });
+
+  const stop = sent.find((call) => call.command === "stop_daemon");
+
+  assert.equal(stop.args.all, true);
+  assert.equal(result.ok, true);
+});
+
+test("with nothing running at all it says so rather than erroring", async () => {
+  stopReply = { ok: true, stopped: [], already_stopped: [] };
+
+  sent.length = 0;
+  const result = await runTool(stopCall(), { sessionKey: "stop-empty" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.stopped, 0);
+  assert.match(result.note, /No server was running/);
+});
+
+test("a session cannot stop a server another session started", async () => {
+  await startServer("owner", "npm start");
+
+  sent.length = 0;
+  const result = await runTool(stopCall("d-npmstart"), { sessionKey: "someone-else" });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not started in this conversation|was started in this conversation/);
+
+  // And nothing was sent, so the other session's server is untouched.
+  assert.ok(!sent.some((call) => call.command === "stop_daemon"));
+});
+
+test("the owning session can stop it by id", async () => {
+  sent.length = 0;
+  const result = await runTool(stopCall("d-npmstart"), { sessionKey: "owner" });
+
+  const stop = sent.find((call) => call.command === "stop_daemon");
+
+  assert.equal(stop.args.job_id, "d-npmstart");
+  assert.equal(result.ok, true);
+});
+
+test("stop_server is never turned into a background job", async () => {
+  const { isBackgroundable } = await import("../src/tools/registry.js");
+
+  // Stopping is what the user is waiting to hear about, and taskkill returns in
+  // moments - queueing it would mean answering "I've started stopping it".
+  assert.equal(isBackgroundable("stop_server"), false);
+});
+
+test("a server is not forgotten when it could not be stopped", async () => {
+  await startServer("stubborn", "npm run serve");
+
+  stopReply = { ok: false, problems: ["still alive after taskkill"], stopped: [], already_stopped: [] };
+
+  sent.length = 0;
+  const failed = await runTool(stopCall(), { sessionKey: "stubborn" });
+  assert.equal(failed.ok, false);
+
+  // Still tracked, so a second attempt targets it rather than falling back to
+  // stopping everything - a server that survived one taskkill must not become
+  // invisible to the next one.
+  stopReply = { ok: true, stopped: ["d-npmrunserve"], already_stopped: [] };
+  sent.length = 0;
+  await runTool(stopCall(), { sessionKey: "stubborn" });
+
+  const stop = sent.find((call) => call.command === "stop_daemon");
+  assert.equal(stop.args.job_id, "d-npmrunserve");
 });
