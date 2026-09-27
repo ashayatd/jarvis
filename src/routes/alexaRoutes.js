@@ -46,6 +46,24 @@ const TOOL_DEADLINE_MS = Number(process.env.TOOL_DEADLINE_MS || 3500);
 
 const DEADLINE = Symbol("deadline");
 
+// The same idea one level up, around the whole turn. The tool deadline can only
+// see one tool at a time, so it cannot catch a turn that is slow by
+// accumulation: three model calls and two tools, each fine on its own, together
+// past what Alexa will wait for. When that happens Alexa gives up on the skill
+// and the user hears an error instead of an answer.
+//
+// Above TOOL_DEADLINE_MS on purpose. A single slow tool should be handed off by
+// the inner race, which returns in about three and a half seconds, so reaching
+// this one means the turn as a whole ran long rather than one step of it.
+const TURN_DEADLINE_MS = Number(process.env.TURN_DEADLINE_MS || 4000);
+
+// A symbol rather than the string it stands for, so it cannot be confused with
+// anything a turn might legitimately resolve to.
+const SHIFT_TO_BACKGROUND = Symbol("shift-to-background");
+
+const HEAVY_TASK_REPLY =
+  "This is a heavy task, I am shifting it to the background. Ask for a status update in a minute.";
+
 // Spoken only if the user goes quiet with the mic still open, and only when
 // there is nothing running to talk about instead.
 const IDLE_REPROMPT = "I'm still here, let me know what to do next.";
@@ -547,7 +565,52 @@ router.post("/alexa", async (req, res) => {
     addUserMessage(chatMemory, userQuery);
     injectFinishedJobs(chatMemory, sessionKey);
 
-    const message = await runConversationTurn(chatMemory, sessionKey);
+    const startedAt = Date.now();
+    const turn = runConversationTurn(chatMemory, sessionKey);
+
+    let timer;
+    const shift = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(SHIFT_TO_BACKGROUND), TURN_DEADLINE_MS);
+    });
+
+    // The turn keeps running whichever way this lands. Nothing is cancelled:
+    // the work is already in flight on the PC, and abandoning it would be worse
+    // than finishing it with nobody waiting.
+    const winner = await Promise.race([turn, shift]);
+    clearTimeout(timer);
+
+    if (winner === SHIFT_TO_BACKGROUND) {
+      const asked = userQuery.length > 60 ? `${userQuery.slice(0, 60)}...` : userQuery;
+
+      logWarn(
+        `[TURN] over ${TURN_DEADLINE_MS}ms session=${sessionKey}`,
+        "- shifting the rest to the background",
+      );
+
+      // Detached before handing off, and this is the whole reason it has to be.
+      // The abandoned turn is still inside its loop and will go on appending
+      // assistant and tool messages as it finishes. If the next turn shared
+      // this history, those writes would interleave with it and strand a tool
+      // message away from the assistant turn that called it, which the API
+      // rejects - so one slow turn would poison every turn after it. Giving the
+      // session a fresh memory leaves the old one to the work that is still
+      // using it, and costs nothing here: the session is closing anyway.
+      session.memory = createChatMemory();
+
+      registerJob({
+        sessionKey,
+        label: `the answer to "${asked}"`,
+        narration: `I'm still working on "${asked}"`,
+        // Mapped to a small result, because this is what the model reads back
+        // later - the whole message object would carry tool_calls and noise.
+        promise: turn.then((finished) => ({ ok: true, asked, reply: finished.content })),
+        startedAt,
+      });
+
+      return res.json(buildAlexaResponse(HEAVY_TASK_REPLY, true, sessionKey));
+    }
+
+    const message = winner;
 
     addAssistantMessage(chatMemory, message);
     trimHistory(chatMemory, 20);
