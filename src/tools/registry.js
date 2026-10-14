@@ -43,10 +43,10 @@ const APP_COMMANDS = {
 // metacharacters, so nothing can be chained, and no absolute path or "..", so
 // nothing outside the workspace can be named.
 //
-// "start" and "npx" are the widest entries by a distance. "start" launches
-// whatever is registered for what follows it, and "npx" fetches and runs code
-// from the registry - once that is a subprocess, no rule here constrains what
-// it does. Narrowing either is a one-line change in this list.
+// "start" and "npx" would be the widest entries by a distance - "start"
+// launches whatever is registered for what follows it, and "npx" fetches and
+// runs code from the registry. Both are narrowed by what may follow them; see
+// ARGUMENT_RULES below.
 const ALLOWED_PREFIXES = [
   // Reading the workspace and the machine. Relative paths only - an absolute
   // one is rejected before this is reached.
@@ -151,10 +151,80 @@ const TRAVERSAL = /\.\./;
 export const escapesWorkspace = (command) =>
   ABSOLUTE_PATH.test(command) || TRAVERSAL.test(command);
 
+// "npx" and "start" were the two entries whose prefix promised the most - npx
+// runs any package from the registry, start runs whatever is registered for
+// what follows it. Each is narrowed here to what is actually asked for by
+// voice, by looking at what comes after the prefix.
+
+// Scaffolders and a static server. Anything else from the registry is refused.
+export const NPX_PACKAGES = ["create-vite", "create-next-app", "create-react-app", "serve"];
+
+// Only the flag that skips npx's install prompt, which would otherwise hang a
+// run with no stdin. Every other flag is refused rather than parsed: "-p evil"
+// and "--package=evil" install a package that is not the one named.
+const NPX_FLAGS = new Set(["-y", "--yes"]);
+
+// The package name, with an optional version or tag: create-vite@latest.
+const NPX_PACKAGE = /^([a-z0-9][a-z0-9._-]*)(?:@[a-z0-9.^~*-]+)?$/;
+
+const npxPackageAllowed = (rest) => {
+  const tokens = rest.split(/\s+/).filter(Boolean);
+  const first = tokens.findIndex((token) => !NPX_FLAGS.has(token));
+
+  if (first === -1 || tokens.slice(0, first).some((token) => !NPX_FLAGS.has(token))) {
+    return false;
+  }
+
+  const match = NPX_PACKAGE.exec(tokens[first]);
+
+  return Boolean(match) && NPX_PACKAGES.includes(match[1]);
+};
+
+// Browsers and notepad, by name. VS Code is still absent for the reason given
+// above APP_COMMANDS.
+export const START_APPS = ["chrome", "msedge", "firefox", "notepad"];
+
+const WEB_URL = /^https?:\/\/[^\s"']+$/;
+
+// "start <url>", "start <app>" or "start <app> <url>". Nothing else - not a
+// file, not a folder, not a second argument.
+const startTargetAllowed = (rest) => {
+  const tokens = rest.split(/\s+/).filter(Boolean);
+
+  if (tokens.length === 1) {
+    return WEB_URL.test(tokens[0]) || START_APPS.includes(tokens[0]);
+  }
+
+  return tokens.length === 2 && START_APPS.includes(tokens[0]) && WEB_URL.test(tokens[1]);
+};
+
+// Keyed by the prefix they narrow. Applied after the prefix has matched.
+const ARGUMENT_RULES = {
+  npx: npxPackageAllowed,
+  start: startTargetAllowed,
+};
+
+// Why a command that passed the prefix list was still refused, for the error
+// the model reads back. Null when nothing narrowed it.
+const argumentRefusal = (command) => {
+  const normalized = command.trim().toLowerCase();
+  const [head] = normalized.split(/\s+/);
+  const rule = ARGUMENT_RULES[head];
+
+  if (!rule || rule(normalized.slice(head.length).trim())) {
+    return null;
+  }
+
+  return head === "npx"
+    ? `npx may only run ${NPX_PACKAGES.join(", ")}.`
+    : `start may only open an http or https address, or one of ${START_APPS.join(", ")}.`;
+};
+
 // Both exported for the same reason as escapesWorkspace: a prefix list is a
 // set of promises about what may follow each entry, and that is worth asserting
 // directly rather than only through whatever a tool does with the answer.
-export const isAllowed = (command) => matchesPrefix(command, ALLOWED_PREFIXES);
+export const isAllowed = (command) =>
+  matchesPrefix(command, ALLOWED_PREFIXES) && argumentRefusal(command) === null;
 
 // Checked before the daemon list, so "node -v" answers instead of being spawned
 // and watched.
@@ -391,7 +461,9 @@ const TOOLS = {
 
         return {
           ok: false,
-          error: `"${command}" is not on the allowed list. Permitted: ${ALLOWED_PREFIXES.join(", ")}.`,
+          error: `"${command}" is not on the allowed list. ${
+            argumentRefusal(command) ?? `Permitted: ${ALLOWED_PREFIXES.join(", ")}.`
+          }`,
         };
       }
 

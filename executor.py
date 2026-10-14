@@ -12,14 +12,22 @@ from flask import Flask, request, jsonify
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # The Node side reads this same .env, and until now this process did not, so
-# any setting put there was silently ignored here - EXECUTOR_SECRET included,
-# which only worked because it happened to match the default below. Existing
-# environment variables still win, so the tests can override.
+# any setting put there was silently ignored here - EXECUTOR_SECRET included.
+# Existing environment variables still win, so the tests can override.
 load_dotenv(os.path.join(HERE, ".env"))
 
 app = Flask(__name__)
 
-SECRET = os.environ.get("EXECUTOR_SECRET", "jarvis_secret_123")
+# No default. A fallback secret is one anybody can read in this repo, and the
+# endpoint runs shell commands - so a missing secret stops the process here
+# rather than starting with a lock everyone has the key to.
+SECRET = os.environ.get("EXECUTOR_SECRET")
+
+if not SECRET:
+    raise SystemExit(
+        "[EXEC] EXECUTOR_SECRET is not set. Add it to .env (the same value the "
+        "Node service sends) or the environment, then start the executor again."
+    )
 
 # Where every command runs, and the one setting that decides which project the
 # Claude CLI edits: it acts on the directory it was started in. This is the
