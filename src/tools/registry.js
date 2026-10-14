@@ -14,9 +14,9 @@ import {
 } from "../services/executorService.js";
 import { log, logError, logWarn, preview, startTimer } from "../utils/logger.js";
 
-// Spoken app names -> the command your PC agent actually receives. None of
-// these have handlers on the agent yet; they need adding there before they
-// will work.
+// Spoken app names -> the command the executor receives. Each has a handler in
+// executor.py that runs a fixed command line; an app with no handler there
+// does not belong here, or the model is offered something that cannot work.
 //
 // VS Code is deliberately absent. It is opened through open_project, which
 // needs a project name, so there is no tool that can drop the user into the
@@ -26,9 +26,6 @@ const APP_COMMANDS = {
   "chrome": "open_chrome",
   "browser": "open_chrome",
   "terminal": "open_terminal",
-  "explorer": "open_explorer",
-  "file explorer": "open_explorer",
-  "spotify": "open_spotify",
 };
 
 // Everything run_command may run, and all of it runs immediately - there is no

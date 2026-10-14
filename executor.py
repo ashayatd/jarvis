@@ -220,6 +220,47 @@ def _launch_vscode(path):
     subprocess.run(f'{VSCODE_BIN} "{path}"', shell=True, cwd=path)
 
 
+# Overridable so the tests can check open_app without a browser or a terminal
+# window appearing for every case.
+APP_LAUNCH_PREFIX = os.environ.get("EXECUTOR_APP_LAUNCH_PREFIX", "")
+
+
+def _terminal_argv():
+    # Windows Terminal when it is installed, opened on the workspace; plain cmd
+    # otherwise, which inherits the workspace as its cwd.
+    wt = shutil.which("wt")
+
+    return [wt, "-d", WORKDIR] if wt else ["cmd", "/c", "start", "", "cmd", "/k"]
+
+
+# Every app open_app can reach, as a fixed command line. The request picks a
+# key and nothing else - no part of what it sends is ever put on a command
+# line, which is the same rule the Node side applies to `start`.
+_APP_LAUNCHERS = {
+    "open_chrome": lambda: ["cmd", "/c", "start", "", "chrome"],
+    "open_terminal": _terminal_argv,
+}
+
+
+def _launch_app(command):
+    argv = _APP_LAUNCHERS[command]()
+
+    if APP_LAUNCH_PREFIX:
+        argv = APP_LAUNCH_PREFIX.split() + argv
+
+    # Not waited on: the app outlives this request by design.
+    subprocess.Popen(
+        argv,
+        cwd=WORKDIR,
+        env=_child_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    return argv
+
+
 def _sweep_jobs():
     now = time.time()
 
@@ -530,6 +571,11 @@ def execute():
 
     data = request.json
     command = data.get("command")
+
+    if command in _APP_LAUNCHERS:
+        argv = _launch_app(command)
+        print(f"[EXEC] {command}: {' '.join(argv)}")
+        return jsonify({"ok": True, "output": f"{command} launched."})
 
     if command == "open_vscode":
         # The path is passed explicitly rather than relying on ".", so the

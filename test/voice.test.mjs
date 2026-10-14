@@ -98,6 +98,9 @@ before(async () => {
       // The node stand-in reads its script from the first argument, so it
       // cannot also be passed --permission-mode. Empty disables the flag.
       EXECUTOR_CLAUDE_PERMISSION_MODE: "",
+      // Prefixed onto every open_app launch, so it is echoed rather than a
+      // browser or terminal window opening for each case.
+      EXECUTOR_APP_LAUNCH_PREFIX: "cmd /c echo",
     },
     stdio: "ignore",
   });
@@ -297,6 +300,44 @@ test("no tool can open VS Code without a project", async () => {
   // root. It must no longer know what VS Code is.
   const openApp = toolSchemas.find((schema) => schema.function.name === "open_app");
   assert.doesNotMatch(openApp.function.parameters.properties.app.description, /vs ?code/i);
+});
+
+// --- open_app ------------------------------------------------------------
+
+const openApp = async (app) => {
+  const { runTool } = await import("../src/tools/registry.js");
+
+  return runTool({ function: { name: "open_app", arguments: JSON.stringify({ app }) } }, {});
+};
+
+test("open_app reaches a real handler for chrome and the terminal", async () => {
+  for (const app of ["chrome", "browser", "terminal", "Chrome"]) {
+    const result = await openApp(app);
+
+    assert.equal(result.ok, true, `${app}: ${JSON.stringify(result)}`);
+  }
+});
+
+test("open_app refuses anything without a handler, VS Code included", async () => {
+  for (const app of ["spotify", "explorer", "vscode", "vs code", "cmd", "notepad.exe"]) {
+    const result = await openApp(app);
+
+    assert.equal(result.ok, false, app);
+    assert.match(result.error, /don't know how to open/);
+  }
+});
+
+test("the executor launches only from its own table", async () => {
+  // Straight at the executor, past the Node side: a command it has no
+  // launcher for is refused, not run.
+  const res = await fetch(process.env.EXECUTOR_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Executor-Secret": SECRET },
+    body: JSON.stringify({ command: "open_spotify" }),
+  });
+
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /Unknown command/);
 });
 
 test("check_directory finds an existing project", async () => {

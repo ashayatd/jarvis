@@ -258,8 +258,60 @@ const SSML_TAGS = [
   [/&lt;\/emphasis&gt;/g, "</emphasis>"],
 ];
 
+// Models write the interjection as a bare tag - "<hmm> The folder contains" -
+// instead of the SSML form the prompt shows. Escaped, that is read out as
+// "less than hmm greater than". A bare tag naming one of these becomes the real
+// thing; any other bare tag is stripped below.
+const INTERJECTION_WORDS = new Set([
+  "hmm",
+  "aha",
+  "got it",
+  "wow",
+  "phew",
+  "whoops",
+  "yay",
+  "uh oh",
+  "oh boy",
+  "oh dear",
+]);
+
+const BARE_TAG = /<\s*(\/?)\s*([a-z][a-z' ]*?)\s*\/?\s*>/gi;
+
+const convertBareInterjections = (text) =>
+  text.replace(BARE_TAG, (whole, closing, name) => {
+    const word = name.trim().toLowerCase();
+
+    if (!INTERJECTION_WORDS.has(word)) return whole;
+
+    return closing ? "" : `<say-as interpret-as="interjection">${word}</say-as>`;
+  });
+
+// Whatever is still tag-shaped after the allowlist is markup the model
+// invented, and Alexa would read it aloud - so it goes, and its text stays.
+// An opening tag glued to the word before it ("Array<string>") is code being
+// talked about rather than markup, and is left to be read as words.
+const STRAY_OPEN_TAG =
+  /(^|[^A-Za-z0-9])&lt;[a-z][\w-]*(?:\s+[\w-]+(?:=(?:"[^"]*"|'[^']*'))?)*\s*\/?&gt;/gi;
+const STRAY_CLOSE_TAG = /&lt;\/[a-z][\w-]*\s*&gt;/gi;
+
+// An allowed opener whose closer was stripped, or the reverse, makes the
+// document invalid - and Alexa then speaks an error instead of anything. A
+// tag that does not balance is removed entirely; its words are kept.
+const PAIRED_TAGS = [
+  [/<say-as interpret-as="interjection">/g, /<\/say-as>/g],
+  [/<emphasis level="(?:strong|moderate|reduced)">/g, /<\/emphasis>/g],
+];
+
+const dropUnbalanced = (ssml) =>
+  PAIRED_TAGS.reduce((text, [open, close]) => {
+    const opens = text.match(open)?.length ?? 0;
+    const closes = text.match(close)?.length ?? 0;
+
+    return opens === closes ? text : text.replace(open, "").replace(close, "");
+  }, ssml);
+
 export const toSsml = (text) => {
-  let escaped = text
+  let escaped = convertBareInterjections(text)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
@@ -268,7 +320,13 @@ export const toSsml = (text) => {
     escaped = escaped.replace(pattern, tag);
   }
 
-  return `<speak>${escaped}</speak>`;
+  const cleaned = dropUnbalanced(
+    escaped.replace(STRAY_OPEN_TAG, "$1").replace(STRAY_CLOSE_TAG, ""),
+  )
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  return `<speak>${cleaned}</speak>`;
 };
 
 const speech = (text) => ({ type: "SSML", ssml: toSsml(text) });

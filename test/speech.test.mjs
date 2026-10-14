@@ -39,13 +39,52 @@ test("angle brackets that are not an allowed tag are escaped", () => {
   assert.match(ssml, /3 &lt; 4/);
 });
 
-test("a tag the model invented is escaped rather than passed through", () => {
-  // An allowlist, so an unknown tag is spoken as words at worst - it can never
-  // produce a document Alexa refuses.
+test("a tag the model invented is stripped, never passed through or read aloud", () => {
+  // An allowlist, so an unknown tag can never produce a document Alexa
+  // refuses - and it is removed rather than escaped, because escaped it is
+  // read out as "less than audio".
   const ssml = toSsml('<audio src="http://evil.test/x.mp3"/> hello');
 
-  assert.match(ssml, /&lt;audio/);
-  assert.ok(!ssml.includes("<audio"));
+  assert.equal(ssml, "<speak>hello</speak>");
+});
+
+// What every reply is checked for: no tag Alexa would read aloud, and a
+// document it will accept.
+const spokenTags = (ssml) => ssml.match(/&lt;\/?[a-z][^&]*?&gt;/gi) ?? [];
+
+test("a bare interjection tag becomes the real interjection", () => {
+  // What Groq actually sent, from a live turn.
+  assert.equal(
+    toSsml("<hmm> The landing page folder contains index.html and package.json."),
+    '<speak><say-as interpret-as="interjection">hmm</say-as> The landing page folder contains index.html and package.json.</speak>',
+  );
+
+  for (const text of ["<Hmm/> right.", "< aha > found it.", "<got it>On it.", "<hmm>ok</hmm>"]) {
+    const ssml = toSsml(text);
+
+    assert.match(ssml, /<say-as interpret-as="interjection">(hmm|aha|got it)<\/say-as>/, text);
+    assert.deepEqual(spokenTags(ssml), [], text);
+  }
+});
+
+test("any other non-SSML tag is stripped and its words kept", () => {
+  for (const [text, spoken] of [
+    ["<b>Done</b>, the server is up.", "Done, the server is up."],
+    ["<sigh> That failed.", "That failed."],
+    ["<speak>nested</speak>", "nested"],
+    ['<voice name="Matthew">hello</voice>', "hello"],
+    ["<thinking>", ""],
+  ]) {
+    assert.equal(toSsml(text), `<speak>${spoken}</speak>`, text);
+  }
+});
+
+test("a tag left without its partner is removed so the document stays valid", () => {
+  // The opener is not on the allowlist and is stripped; the closer is, and on
+  // its own would make the document invalid.
+  assert.equal(toSsml('<emphasis level="whatever">x</emphasis>'), "<speak>x</speak>");
+  assert.equal(toSsml('<say-as interpret-as="interjection">hmm'), "<speak>hmm</speak>");
+  assert.equal(toSsml("done</say-as>"), "<speak>done</speak>");
 });
 
 test("a break and an emphasis are allowed, with their values pinned", () => {
@@ -55,8 +94,8 @@ test("a break and an emphasis are allowed, with their values pinned", () => {
     /<emphasis level="strong">really<\/emphasis>/,
   );
 
-  // Not on the allowlist, so escaped.
-  assert.match(toSsml('<emphasis level="whatever">x</emphasis>'), /&lt;emphasis/);
+  // Not on the allowlist, so it does not survive as a tag.
+  assert.ok(!toSsml('<emphasis level="whatever">x</emphasis>').includes("emphasis"));
 });
 
 test("the document is always wrapped in speak", () => {
