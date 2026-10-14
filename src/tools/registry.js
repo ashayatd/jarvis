@@ -354,13 +354,13 @@ const TOOLS = {
       function: {
         name: "open_app",
         description:
-          "Open an application on the user's Windows PC. Use when the user asks to open, launch or start a program.",
+          "Open an application on the user's PC.",
         parameters: {
           type: "object",
           properties: {
             app: {
               type: "string",
-              description: `Application to open. Known values: ${Object.keys(APP_COMMANDS).join(", ")}.`,
+              description: `One of: ${Object.keys(APP_COMMANDS).join(", ")}.`,
             },
           },
           required: ["app"],
@@ -396,31 +396,28 @@ const TOOLS = {
       function: {
         name: "run_command",
         description:
-          `Run a command on the user's PC and return its output. Anything starting with one of these is allowed: ${ALLOWED_PREFIXES.join(", ")}. Start a project however it is built - "npm start" or "npm run dev" for node, "python app.py" for python - and pass open_browser true in the same call to have the page opened once it is up. A server does not finish: the reply comes back with started true and the work carries on, so say it is running rather than waiting for it. Always pass cwd for anything belonging to a project, or the command runs in the workspace root and finds no package.json. Do not use this for coding or file edits - that is what run_claude is for. Nothing else is permitted, commands may not be chained, and every path must be relative to the workspace.`,
+          `Run one command on the user's PC and return its output. Allowed: ${ALLOWED_PREFIXES.join(", ")}; npx only ${NPX_PACKAGES.join(", ")}; start only a URL or ${START_APPS.join(", ")}. No chaining, relative paths only. Not for editing code - use run_claude.`,
         parameters: {
           type: "object",
           properties: {
             command: {
               type: "string",
-              description: "The command line to run, e.g. 'git status' or 'npm run dev'.",
+              description: "e.g. 'git status' or 'npm run dev'.",
             },
             cwd: {
               // Must accept null: the model sends cwd=null when omitting it,
               // and Groq validates tool arguments server-side and 400s on a
               // bare "string".
               type: ["string", "null"],
-              description:
-                "Optional project folder to run in, e.g. 'landing page'. Pass this whenever the command belongs to a project - 'npm start' in the workspace root will not find the project's package.json. Omit or pass null for a command about the machine itself.",
+              description: "Project folder, e.g. 'landing page'. Null for commands about the machine.",
             },
             open_browser: {
               type: ["boolean", "null"],
-              description:
-                "Pass true when starting a dev server the user wants to see. The page is opened at whatever address the server reported, so you do not need to know the port or call 'start' yourself. Ignored for commands that are not servers.",
+              description: "True when starting a dev server the user wants to see; opens the address it reports.",
             },
             port: {
               type: ["integer", "null"],
-              description:
-                "Only useful with open_browser, and only as a fallback: if the server prints its address, that is used instead. Pass the port you expect from package.json - 5173 for vite, 3000 for create-react-app or next.",
+              description: "Fallback port for open_browser if the server prints no address.",
             },
           },
           required: ["command"],
@@ -553,22 +550,20 @@ const TOOLS = {
       function: {
         name: "run_claude",
         description:
-          "Hand a coding or file-editing task to the Claude CLI on the user's PC. Use this for anything that writes, edits, refactors, explains or reviews code - it is the only tool that can change files. Pass the user's request as the prompt, in full and in plain English, and append the instruction the system prompt gives you for this tool. It runs straight away without asking, and takes minutes, so say what you are starting and let it finish in the background.",
+          "Give a coding task - write, edit, refactor, explain or review code - to the Claude CLI. The only tool that changes files. Takes minutes.",
         parameters: {
           type: "object",
           properties: {
             prompt: {
               type: "string",
-              description:
-                "The instruction for Claude, e.g. 'build a landing page with a signup form'. Write it out in full - Claude cannot see this conversation.",
+              description: "The full request in plain English; Claude cannot see this conversation.",
             },
             cwd: {
               // Must accept null: the model sends cwd=null when omitting it,
               // and Groq validates tool arguments server-side and 400s on a
               // bare "string".
               type: ["string", "null"],
-              description:
-                "Optional project folder to work in, e.g. 'landing page'. Always pass this when the user is working on a project, or the files land in the workspace root instead of the project. The folder must already exist - check_directory first. Omit or pass null only when no project has been named.",
+              description: "Project folder; must already exist. Null only if no project is named.",
             },
           },
           required: ["prompt"],
@@ -619,14 +614,13 @@ const TOOLS = {
       function: {
         name: "check_directory",
         description:
-          "Check whether a project folder already exists in the user's workspace. Always call this before opening or creating a project. It is instant, read-only and needs no confirmation. It also returns the projects that do exist, so you can offer them if the name was misheard.",
+          "Check whether a project exists in the workspace, and list the projects that do. Instant.",
         parameters: {
           type: "object",
           properties: {
             project: {
               type: "string",
-              description:
-                "The project name as the user said it, e.g. 'landing page'. Spaces are fine - it is matched against the folder names on disk.",
+              description: "As the user said it, e.g. 'landing page'.",
             },
           },
           required: ["project"],
@@ -650,13 +644,13 @@ const TOOLS = {
       function: {
         name: "open_project",
         description:
-          "Open an existing project from the user's workspace in VS Code. Only call this after check_directory has confirmed the folder exists. This is the only way to open VS Code - there is no tool that opens the workspace root, so if the user has not named a project yet, ask them which one.",
+          "Open an existing project in VS Code. The only way to open VS Code.",
         parameters: {
           type: "object",
           properties: {
             project: {
               type: "string",
-              description: "The project name, as passed to check_directory.",
+              description: "As passed to check_directory.",
             },
           },
           required: ["project"],
@@ -681,13 +675,13 @@ const TOOLS = {
       function: {
         name: "init_project",
         description:
-          "Create a new project folder in the user's workspace, run git init inside it and open it in VS Code. Call this when check_directory reports the project does not exist. Do not ask whether to create it - say that you are setting it up and call this.",
+          "Create a project folder, git init it and open it in VS Code.",
         parameters: {
           type: "object",
           properties: {
             project: {
               type: "string",
-              description: "The project name, as passed to check_directory.",
+              description: "As passed to check_directory.",
             },
           },
           required: ["project"],
@@ -713,7 +707,7 @@ const TOOLS = {
       function: {
         name: "check_running_servers",
         description:
-          "List the dev servers currently running on the user's PC, with their addresses and how long they have been up. Call this whenever the user asks what is running, what servers or environments are active, whether a project is still up, or for the state of their dev environment. It is instant and read-only.",
+          "List running dev servers with their addresses and uptime.",
         parameters: { type: "object", properties: {} },
       },
     },
@@ -763,7 +757,7 @@ const TOOLS = {
       function: {
         name: "stop_server",
         description:
-          "Stop a dev server started earlier. Call this when the user asks to stop the server, shut the project down, or kill the dev environment. Takes no arguments in the normal case - it stops the server running in this conversation, or the ones still up from an earlier one if this conversation started none.",
+          "Stop the dev servers this conversation started, or any still running if it started none.",
         parameters: {
           type: "object",
           properties: {
@@ -772,8 +766,7 @@ const TOOLS = {
               // and Groq validates tool arguments server-side and 400s on a
               // bare "string".
               type: ["string", "null"],
-              description:
-                "Only when stopping one specific server out of several, using an id from a previous result. Omit or pass null to stop the server in this conversation.",
+              description: "Only to stop one of several, by an id from a result.",
             },
           },
         },
@@ -847,7 +840,7 @@ const TOOLS = {
       function: {
         name: "check_background_jobs",
         description:
-          "Check background tasks - a Claude build, an install, a project being scaffolded. Call this whenever the user asks whether something finished, says 'is it done', asks for a status update, or asks about work you told them you had started, even if that was in an earlier conversation. It reads every job, not only this conversation's, so it still answers after the skill has been closed and re-opened. Report the result it gives you: what finished and what it produced, or that it is still going and roughly how long it has been.",
+          "Status of background work - Claude builds, installs, scaffolding - from every conversation: what finished and what it produced, or how long it has been running.",
         parameters: {
           type: "object",
           properties: {
@@ -855,7 +848,7 @@ const TOOLS = {
               // Must accept null: the model sends job_id=null when omitting it, and
               // Groq validates tool arguments server-side and 400s on a bare "string".
               type: ["string", "null"],
-              description: "Optional specific job id. Omit or pass null to list every job.",
+              description: "Optional; null for every job.",
             },
           },
         },
