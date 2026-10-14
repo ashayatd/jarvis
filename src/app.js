@@ -13,8 +13,11 @@ const app = express();
 // showing up as a 401 from the executor twenty minutes later.
 log("=".repeat(60));
 log("AI mode starting");
-log(`  model          : ${process.env.GROQ_MODEL || "openai/gpt-oss-120b (default)"}`);
+log(`  llm primary    : ${process.env.LLM_PRIMARY || "groq (default)"}`);
+log(`  groq model     : ${process.env.GROQ_MODEL || "openai/gpt-oss-120b (default)"} timeout ${process.env.GROQ_TIMEOUT_MS || 2000}ms`);
 log(`  groq key       : ${process.env.GROQ_API_KEY ? "set" : "MISSING"}`);
+log(`  ollama         : ${process.env.OLLAMA_MODEL || "qwen2.5:3b"} at ${process.env.OLLAMA_BASE_URL || "http://localhost:11434/v1"}`);
+log(`  breaker        : ${process.env.BREAKER_COOLDOWN_MS || 60000}ms cooldown`);
 log(`  executor url   : ${process.env.EXECUTOR_URL || process.env.VSCODE_AUTOMATION_URL || "http://127.0.0.1:5000/execute (default)"}`);
 log(`  executor secret: ${process.env.EXECUTOR_SECRET ? "set (header will be sent)" : "NOT SET - no auth header will be sent"}`);
 log(`  tool deadline  : ${process.env.TOOL_DEADLINE_MS || 3500}ms`);
@@ -30,7 +33,7 @@ app.use((req, res, next) => {
 app.use(alexaRoutes);
 
 app.get("/", (req, res) => {
-  res.send("AI mode running with Groq 🚀");
+  res.send("AI mode running 🚀");
 });
 
 export default app;

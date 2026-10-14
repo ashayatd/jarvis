@@ -17,7 +17,7 @@ import {
   takeUnreportedJobs,
 } from "../data/jobRegistry.js";
 import { BACKGROUND_TIMEOUT_MS } from "../services/executorService.js";
-import { generateAIReply } from "../services/groqService.js";
+import { generateAIReply } from "../services/llmService.js";
 import {
   describeToolCall,
   isBackgroundable,
@@ -359,10 +359,27 @@ const runToolOrBackground = async (toolCall, sessionKey) => {
   return { mode: "background", job };
 };
 
+// "groq 812ms + ollama 2410ms" - which model answered each call of a turn and
+// how long it took, for the turn's closing log line.
+const describeLlmCalls = (calls) =>
+  calls.length ? calls.map(({ provider, latencyMs }) => `${provider} ${latencyMs}ms`).join(" + ") : "none";
+
 // Runs the model, executes any tools it asks for, feeds results back, and
-// repeats until it produces something to say.
-const runConversationTurn = async (chatMemory, sessionKey) => {
-  let message = await generateAIReply(chatMemory, { tools: toolSchemas });
+// repeats until it produces something to say. Every model call is recorded in
+// `llmCalls`, which the caller owns so it can still read it after a turn has
+// been shifted to the background.
+const runConversationTurn = async (chatMemory, sessionKey, llmCalls = []) => {
+  const ask = async () => {
+    const reply = await generateAIReply(chatMemory, { tools: toolSchemas });
+
+    if (reply.provider) {
+      llmCalls.push({ provider: reply.provider, latencyMs: reply.latencyMs });
+    }
+
+    return reply;
+  };
+
+  let message = await ask();
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     if (!message.tool_calls?.length) {
@@ -413,7 +430,7 @@ const runConversationTurn = async (chatMemory, sessionKey) => {
       };
     }
 
-    message = await generateAIReply(chatMemory, { tools: toolSchemas });
+    message = await ask();
   }
 
   // Ran out of rounds while still asking for tools - say something rather
@@ -566,7 +583,8 @@ router.post("/alexa", async (req, res) => {
     injectFinishedJobs(chatMemory, sessionKey);
 
     const startedAt = Date.now();
-    const turn = runConversationTurn(chatMemory, sessionKey);
+    const llmCalls = [];
+    const turn = runConversationTurn(chatMemory, sessionKey, llmCalls);
 
     let timer;
     const shift = new Promise((resolve) => {
@@ -603,7 +621,11 @@ router.post("/alexa", async (req, res) => {
         narration: `I'm still working on "${asked}"`,
         // Mapped to a small result, because this is what the model reads back
         // later - the whole message object would carry tool_calls and noise.
-        promise: turn.then((finished) => ({ ok: true, asked, reply: finished.content })),
+        promise: turn.then((finished) => {
+          log(`[TURN] background turn finished session=${sessionKey} llm=${describeLlmCalls(llmCalls)}`);
+
+          return { ok: true, asked, reply: finished.content };
+        }),
         startedAt,
       });
 
@@ -613,10 +635,11 @@ router.post("/alexa", async (req, res) => {
     const message = winner;
 
     addAssistantMessage(chatMemory, message);
-    trimHistory(chatMemory, 20);
+    trimHistory(chatMemory);
 
     log(
       `[TURN] complete in ${turnTimer()}ms`,
+      `llm=${describeLlmCalls(llmCalls)}`,
       `history=${chatMemory.messages.length} msgs`,
       `jobs=${jobCount()}`,
       message.endSession ? "[closing for background work]" : "",

@@ -44,7 +44,7 @@ process.env.EXECUTOR_SECRET = "test_secret";
 
 const scripted = [];
 
-mock.module(new URL("../src/services/groqService.js", import.meta.url).href, {
+mock.module(new URL("../src/services/llmService.js", import.meta.url).href, {
   namedExports: {
     generateAIReply: async () => {
       if (!scripted.length) {

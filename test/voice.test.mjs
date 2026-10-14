@@ -49,7 +49,7 @@ process.env.EXECUTOR_VSCODE_BIN = "cmd /c echo";
 // One scripted assistant reply is consumed per generateAIReply call.
 const scripted = [];
 
-mock.module(new URL("../src/services/groqService.js", import.meta.url).href, {
+mock.module(new URL("../src/services/llmService.js", import.meta.url).href, {
   namedExports: {
     generateAIReply: async () => {
       if (!scripted.length) {

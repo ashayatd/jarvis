@@ -15,7 +15,7 @@ process.env.EXECUTOR_URL = "http://127.0.0.1:9/execute";
 let replyDelayMs = 0;
 const scripted = [];
 
-mock.module(new URL("../src/services/groqService.js", import.meta.url).href, {
+mock.module(new URL("../src/services/llmService.js", import.meta.url).href, {
   namedExports: {
     generateAIReply: async () => {
       if (!scripted.length) {
